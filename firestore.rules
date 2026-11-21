@@ -68,7 +68,7 @@ service cloud.firestore {
           'binaryParentId', 'binaryLeg', 'packageTier', 'rankId',
           'status', 'role', 'personalPv', 'personalCv', 'leftBranchCv',
           'rightBranchCv', 'teamCv', 'directCount', 'activeLines',
-          'firstWeekPurchase', 'uplineUids', 'joinedAt', 'updatedAt'
+          'firstWeekPurchase', 'uplineUids', 'pinHash', 'joinedAt', 'updatedAt'
         ])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
@@ -95,7 +95,29 @@ service cloud.firestore {
         && data.firstWeekPurchase is bool
         && data.uplineUids is list && data.uplineUids.size() <= 20
         && (data.uplineUids.size() == 0 || data.uplineUids[0] is string)
+        && (!('pinHash' in data) || (data.pinHash is string && data.pinHash.size() <= 128))
         && data.joinedAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAffiliatePin(data) {
+      return data.keys().hasAll([
+          'id', 'pinCode', 'partnerId', 'partnerName', 'referralCode',
+          'active', 'claimedByUid', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'pinCode', 'partnerId', 'partnerName', 'referralCode',
+          'active', 'claimedByUid', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.pinCode is string && data.pinCode.size() >= 4 && data.pinCode.size() <= 16 && data.pinCode.matches('^[a-zA-Z0-9_\\-]+$')
+        && isValidId(data.partnerId)
+        && data.partnerName is string && data.partnerName.size() >= 2 && data.partnerName.size() <= 120
+        && data.referralCode is string && data.referralCode.size() >= 3 && data.referralCode.size() <= 32
+        && data.active is bool
+        && data.claimedByUid is string && data.claimedByUid.size() <= 128
+        && isValidId(data.createdBy)
+        && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
 
@@ -164,7 +186,7 @@ service cloud.firestore {
           'sponsorId', 'isFirstPurchase', 'items', 'subtotalBs',
           'surchargeBs', 'totalBs', 'totalPv', 'totalCv', 'paymentMethod',
           'paymentReference', 'receiptNote', 'paymentStatus', 'validatedBy',
-          'createdAt', 'updatedAt'
+          'pinProof', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.id)
         && data.orderNumber is string && data.orderNumber.size() >= 3 && data.orderNumber.size() <= 40
@@ -185,6 +207,7 @@ service cloud.firestore {
         && data.receiptNote is string && data.receiptNote.size() <= 300
         && data.paymentStatus in ['pendiente', 'validado', 'rechazado']
         && data.validatedBy is string && data.validatedBy.size() <= 128
+        && (!('pinProof' in data) || (isValidId(data.pinProof) && data.pinProof.size() >= 16))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -229,7 +252,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'id', 'partnerId', 'partnerUid', 'partnerName', 'amountBs',
           'method', 'destinationAccount', 'status', 'reviewedBy',
-          'reviewNote', 'createdAt', 'updatedAt'
+          'reviewNote', 'pinProof', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.id)
         && isValidId(data.partnerId)
@@ -241,6 +264,7 @@ service cloud.firestore {
         && data.status in ['pendiente', 'aprobado', 'rechazado']
         && data.reviewedBy is string && data.reviewedBy.size() <= 128
         && data.reviewNote is string && data.reviewNote.size() <= 240
+        && (!('pinProof' in data) || (isValidId(data.pinProof) && data.pinProof.size() >= 16))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -298,17 +322,29 @@ service cloud.firestore {
     }
 
     match /partners/{partnerId} {
-      allow get: if isValidId(partnerId) && isVerified() && (
-        isAdmin() ||
-        existing().ownerUid == request.auth.uid ||
-        request.auth.uid in existing().uplineUids ||
-        existing().id == 'vn_root'
+      allow get: if isValidId(partnerId) && (
+        (isVerified() && (
+          isAdmin() ||
+          existing().ownerUid == request.auth.uid ||
+          request.auth.uid in existing().uplineUids ||
+          existing().id == 'vn_root'
+        )) ||
+        (
+          resource != null &&
+          'pinHash' in existing() &&
+          existing().pinHash is string &&
+          existing().pinHash.size() >= 16 &&
+          get(/databases/$(database)/documents/affiliate_pins/$(existing().pinHash)).data.active == true
+        ) ||
+        (resource != null && existing().id == 'vn_root')
       );
-      allow list: if isVerified() && (
+      allow list: if (isVerified() && (
         isBootstrappedAdmin() ||
         resource.data.ownerUid == request.auth.uid ||
         request.auth.uid in resource.data.uplineUids ||
         resource.data.id == 'vn_root'
+      )) || (
+        resource.data.status in ['activo', 'pendiente', 'inactivo']
       );
       allow create: if isValidId(partnerId) && isVerified() && isValidPartner(incoming())
         && incoming().joinedAt == request.time
@@ -339,6 +375,20 @@ service cloud.firestore {
             incoming().rankId == existing().rankId &&
             incoming().status == existing().status &&
             incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'updatedAt'])
+          ) ||
+          (
+            'pinHash' in existing() &&
+            existing().pinHash is string &&
+            existing().pinHash.size() >= 16 &&
+            get(/databases/$(database)/documents/affiliate_pins/$(existing().pinHash)).data.active == true &&
+            get(/databases/$(database)/documents/affiliate_pins/$(existing().pinHash)).data.partnerId == partnerId &&
+            get(/databases/$(database)/documents/affiliate_pins/$(existing().pinHash)).data.claimedByUid == '' &&
+            getAfter(/databases/$(database)/documents/affiliate_pins/$(existing().pinHash)).data.claimedByUid == request.auth.uid &&
+            incoming().ownerUid == request.auth.uid &&
+            incoming().role == existing().role &&
+            incoming().rankId == existing().rankId &&
+            incoming().status == existing().status &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['ownerUid', 'uplineUids', 'updatedAt'])
           )
         );
       allow delete: if isValidId(partnerId) && isAdmin();
@@ -361,13 +411,18 @@ service cloud.firestore {
           );
         allow update: if isValidId(partnerId) && isValidId(docId) && isVerified() && isValidPartnerPrivateInfo(incoming())
           && incoming().partnerId == existing().partnerId
-          && incoming().ownerUid == existing().ownerUid
           && incoming().updatedAt == request.time
           && (
             isAdmin() ||
             (
+              incoming().ownerUid == existing().ownerUid &&
               existing().ownerUid == request.auth.uid &&
               incoming().diff(existing()).affectedKeys().hasOnly(['phone', 'ciNumber', 'city', 'bankName', 'bankAccount', 'updatedAt'])
+            ) ||
+            (
+              incoming().ownerUid == request.auth.uid &&
+              getAfter(/databases/$(database)/documents/partners/$(partnerId)).data.ownerUid == request.auth.uid &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['ownerUid', 'updatedAt'])
             )
           );
         allow delete: if isValidId(partnerId) && isValidId(docId) && isAdmin();
@@ -388,15 +443,29 @@ service cloud.firestore {
     }
 
     match /orders/{orderId} {
-      allow get: if isValidId(orderId) && isVerified() && (isAdmin() || existing().buyerUid == request.auth.uid);
-      allow list: if isVerified() && (isBootstrappedAdmin() || resource.data.buyerUid == request.auth.uid);
-      allow create: if isValidId(orderId) && isVerified() && isValidOrder(incoming())
+      allow get: if isValidId(orderId) && (
+        (isVerified() && (isAdmin() || existing().buyerUid == request.auth.uid)) ||
+        (resource != null && existing().partnerId is string && existing().partnerId.size() >= 1)
+      );
+      allow list: if (isVerified() && (isBootstrappedAdmin() || resource.data.buyerUid == request.auth.uid))
+        || (resource.data.partnerId is string && resource.data.partnerId.size() >= 1);
+      allow create: if isValidId(orderId) && isValidOrder(incoming())
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
         && (
           isAdmin() ||
           (
+            isVerified() &&
             incoming().buyerUid == request.auth.uid &&
+            incoming().paymentStatus == 'pendiente' &&
+            incoming().validatedBy == ''
+          ) ||
+          (
+            'pinProof' in incoming() &&
+            isValidId(incoming().pinProof) &&
+            exists(/databases/$(database)/documents/affiliate_pins/$(incoming().pinProof)) &&
+            get(/databases/$(database)/documents/affiliate_pins/$(incoming().pinProof)).data.active == true &&
+            get(/databases/$(database)/documents/affiliate_pins/$(incoming().pinProof)).data.partnerId == incoming().partnerId &&
             incoming().paymentStatus == 'pendiente' &&
             incoming().validatedBy == ''
           )
@@ -419,8 +488,12 @@ service cloud.firestore {
     }
 
     match /commissions/{commissionId} {
-      allow get: if isValidId(commissionId) && isVerified() && (isAdmin() || existing().partnerUid == request.auth.uid);
-      allow list: if isVerified() && (isBootstrappedAdmin() || resource.data.partnerUid == request.auth.uid);
+      allow get: if isValidId(commissionId) && (
+        (isVerified() && (isAdmin() || existing().partnerUid == request.auth.uid)) ||
+        (resource != null && existing().partnerId is string && existing().partnerId.size() >= 1)
+      );
+      allow list: if (isVerified() && (isBootstrappedAdmin() || resource.data.partnerUid == request.auth.uid))
+        || (resource.data.partnerId is string && resource.data.partnerId.size() >= 1);
       allow create: if isValidId(commissionId) && isAdmin() && isValidCommission(incoming())
         && incoming().createdAt == request.time;
       allow update: if isValidId(commissionId) && isAdmin() && isValidCommission(incoming())
@@ -430,15 +503,29 @@ service cloud.firestore {
     }
 
     match /withdrawals/{withdrawalId} {
-      allow get: if isValidId(withdrawalId) && isVerified() && (isAdmin() || existing().partnerUid == request.auth.uid);
-      allow list: if isVerified() && (isBootstrappedAdmin() || resource.data.partnerUid == request.auth.uid);
-      allow create: if isValidId(withdrawalId) && isVerified() && isValidWithdrawal(incoming())
+      allow get: if isValidId(withdrawalId) && (
+        (isVerified() && (isAdmin() || existing().partnerUid == request.auth.uid)) ||
+        (resource != null && existing().partnerId is string && existing().partnerId.size() >= 1)
+      );
+      allow list: if (isVerified() && (isBootstrappedAdmin() || resource.data.partnerUid == request.auth.uid))
+        || (resource.data.partnerId is string && resource.data.partnerId.size() >= 1);
+      allow create: if isValidId(withdrawalId) && isValidWithdrawal(incoming())
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
         && (
           isAdmin() ||
           (
+            isVerified() &&
             incoming().partnerUid == request.auth.uid &&
+            incoming().status == 'pendiente' &&
+            incoming().reviewedBy == ''
+          ) ||
+          (
+            'pinProof' in incoming() &&
+            isValidId(incoming().pinProof) &&
+            exists(/databases/$(database)/documents/affiliate_pins/$(incoming().pinProof)) &&
+            get(/databases/$(database)/documents/affiliate_pins/$(incoming().pinProof)).data.active == true &&
+            get(/databases/$(database)/documents/affiliate_pins/$(incoming().pinProof)).data.partnerId == incoming().partnerId &&
             incoming().status == 'pendiente' &&
             incoming().reviewedBy == ''
           )
@@ -452,7 +539,7 @@ service cloud.firestore {
     }
 
     match /plan_config/{configId} {
-      allow get: if isValidId(configId) && isVerified();
+      allow get: if isValidId(configId) && (isVerified() || configId == 'default');
       allow list: if isVerified() && resource.data.cvToBsRate > 0;
       allow create, update: if isValidId(configId) && isAdmin() && isValidPlanConfig(incoming())
         && incoming().updatedAt == request.time;
@@ -465,7 +552,40 @@ service cloud.firestore {
       allow create: if isValidId(logId) && isAdmin() && isValidAuditLog(incoming())
         && incoming().actorUid == request.auth.uid
         && incoming().createdAt == request.time;
-      allow update, delete: if false;
+      allow update: if false;
+      allow delete: if isValidId(logId) && isAdmin();
+    }
+
+    match /affiliate_pins/{pinId} {
+      allow get: if isValidId(pinId) && (
+        isAdmin() ||
+        (resource != null && existing().active == true && (
+          !isSignedIn() ||
+          (isVerified() && (existing().claimedByUid == '' || existing().claimedByUid == request.auth.uid))
+        ))
+      );
+      allow list: if isBootstrappedAdmin();
+      allow create: if isValidId(pinId) && isAdmin() && isValidAffiliatePin(incoming())
+        && incoming().id == pinId
+        && incoming().createdBy == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(pinId) && isVerified() && isValidAffiliatePin(incoming())
+        && incoming().id == existing().id
+        && incoming().partnerId == existing().partnerId
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (
+            existing().active == true &&
+            existing().claimedByUid == '' &&
+            incoming().claimedByUid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['claimedByUid', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(pinId) && isAdmin();
     }
   }
 }

@@ -2,13 +2,19 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   ChevronDown,
   ChevronRight,
+  Focus,
   GitBranch,
+  Maximize2,
+  Minimize2,
   Network,
+  Plus,
   Search,
   UserCheck,
   UserPlus,
   Users,
   X,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import { AFFILIATION_PACKAGES, RANK_MAP } from '../data/compensationPlan';
 import {
@@ -22,22 +28,66 @@ interface NetworkModuleProps {
   currentPartner: Partner;
   partners: Partner[];
   currentUserUid: string;
+  isAdmin?: boolean;
+  isPinSession?: boolean;
 }
+
+interface VisualTreeNode {
+  key: string;
+  partner?: Partner;
+  parentPartnerId?: string;
+  legLabel: string;
+  binaryLeg?: 'left' | 'right';
+  depth: number;
+  hasChildren: boolean;
+  isExpanded: boolean;
+  totalDirectCount: number;
+  children: VisualTreeNode[];
+  subtreeWidth: number;
+  x: number;
+  y: number;
+  centerX: number;
+}
+
+interface TreeEdge {
+  id: string;
+  fromX: number;
+  fromY: number;
+  toX: number;
+  toY: number;
+  depth: number;
+  status: 'activo' | 'pendiente' | 'inactivo' | 'empty';
+  isSelectedPath: boolean;
+}
+
+const NODE_W = 204;
+const NODE_H = 104;
+const H_GAP = 26;
+const V_GAP = 64;
+const PAD_X = 32;
+const PAD_TOP = 38;
+const PAD_BOTTOM = 28;
 
 export const NetworkModule: React.FC<NetworkModuleProps> = ({
   currentPartner,
   partners,
   currentUserUid,
+  isAdmin = false,
+  isPinSession = false,
 }) => {
+  const defaultRootId = useMemo(() => {
+    if (isAdmin) {
+      return partners.find((p) => p.id === 'vn_root')?.id || currentPartner.id;
+    }
+    return currentPartner.id;
+  }, [isAdmin, partners, currentPartner.id]);
+
   const [treeView, setTreeView] = useState<'unilevel' | 'binary'>('unilevel');
-  const [searchTerm, setSearchTerm] = useState('');
+  const [rootPartnerId, setRootPartnerId] = useState<string>(defaultRootId);
   const [selectedPartnerId, setSelectedPartnerId] = useState<string>(currentPartner.id);
-  const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({
-    [currentPartner.id]: true,
-    vn_root: true,
-    vn_p_valeria: true,
-    vn_p_carlos: true,
-  });
+  const [zoom, setZoom] = useState<number>(1);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({});
 
   // Private PII modal/section for own node
   const [privateInfo, setPrivateInfo] = useState<PartnerPrivateInfo | null>(null);
@@ -70,6 +120,10 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
   });
 
   useEffect(() => {
+    setRootPartnerId(defaultRootId);
+  }, [defaultRootId]);
+
+  useEffect(() => {
     let active = true;
     fetchPartnerPrivateInfo(currentPartner.id)
       .then((info) => {
@@ -91,6 +145,14 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
       active = false;
     };
   }, [currentPartner.id]);
+
+  const activeRootPartner = useMemo(() => {
+    return (
+      partners.find((p) => p.id === rootPartnerId) ||
+      partners.find((p) => p.id === defaultRootId) ||
+      currentPartner
+    );
+  }, [partners, rootPartnerId, defaultRootId, currentPartner]);
 
   const selectedPartner = useMemo(
     () => partners.find((p) => p.id === selectedPartnerId) || currentPartner,
@@ -117,9 +179,206 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
   const majorCv = Math.max(selectedPartner.leftBranchCv, selectedPartner.rightBranchCv);
   const eqPercent = majorCv > 0 ? Math.round((minorCv / majorCv) * 1000) / 10 : 100;
 
-  const toggleExpand = (id: string) => {
-    setExpandedNodes((prev) => ({ ...prev, [id]: !prev[id] }));
+  const isNodeExpanded = (id: string, depth: number): boolean => {
+    if (Object.prototype.hasOwnProperty.call(expandedNodes, id)) {
+      return expandedNodes[id];
+    }
+    return treeView === 'binary' ? depth < 2 : depth < 3;
   };
+
+  const toggleExpand = (id: string, currentDepth: number) => {
+    const currentState = isNodeExpanded(id, currentDepth);
+    setExpandedNodes((prev) => ({ ...prev, [id]: !currentState }));
+  };
+
+  const handleExpandAll = () => {
+    const next: Record<string, boolean> = {};
+    partners.forEach((p) => {
+      next[p.id] = true;
+    });
+    setExpandedNodes(next);
+  };
+
+  const handleCollapseToRoot = () => {
+    const next: Record<string, boolean> = {};
+    partners.forEach((p) => {
+      next[p.id] = p.id === activeRootPartner.id;
+    });
+    setExpandedNodes(next);
+  };
+
+  const openRecruitForSlot = (parentPartnerId: string, leg: BinaryLeg) => {
+    setRecruitForm((prev) => ({
+      ...prev,
+      sponsorId: parentPartnerId,
+      binaryParentId: parentPartnerId,
+      binaryLeg: leg,
+    }));
+    setShowRecruitModal(true);
+  };
+
+  // Build hierarchical tree structure & compute exact SVG branch coordinates
+  const treeLayout = useMemo(() => {
+    const visited = new Set<string>();
+
+    const buildUnilevel = (partner: Partner, depth: number, legLabel: string): VisualTreeNode => {
+      visited.add(partner.id);
+      const childrenPartners = partners.filter((p) => p.sponsorId === partner.id && !visited.has(p.id));
+      const expanded = isNodeExpanded(partner.id, depth);
+      const children: VisualTreeNode[] = expanded
+        ? childrenPartners.map((child, idx) =>
+            buildUnilevel(child, depth + 1, `Rama ${idx + 1} · N${depth + 1}`)
+          )
+        : [];
+
+      return {
+        key: partner.id,
+        partner,
+        legLabel: depth === 0 ? 'Tronco Principal' : legLabel,
+        depth,
+        hasChildren: childrenPartners.length > 0,
+        isExpanded: expanded,
+        totalDirectCount: childrenPartners.length,
+        children,
+        subtreeWidth: NODE_W,
+        x: 0,
+        y: 0,
+        centerX: 0,
+      };
+    };
+
+    const buildBinary = (
+      partner: Partner | undefined,
+      depth: number,
+      legLabel: string,
+      parentPartnerId?: string,
+      binaryLeg?: 'left' | 'right'
+    ): VisualTreeNode => {
+      if (!partner) {
+        return {
+          key: `empty_${parentPartnerId}_${binaryLeg}`,
+          parentPartnerId,
+          binaryLeg,
+          legLabel,
+          depth,
+          hasChildren: false,
+          isExpanded: false,
+          totalDirectCount: 0,
+          children: [],
+          subtreeWidth: NODE_W,
+          x: 0,
+          y: 0,
+          centerX: 0,
+        };
+      }
+
+      visited.add(partner.id);
+      const leftChild = partners.find(
+        (p) => p.binaryParentId === partner.id && p.binaryLeg === 'left' && !visited.has(p.id)
+      );
+      const rightChild = partners.find(
+        (p) => p.binaryParentId === partner.id && p.binaryLeg === 'right' && !visited.has(p.id)
+      );
+      const expanded = isNodeExpanded(partner.id, depth);
+
+      const children: VisualTreeNode[] = expanded
+        ? [
+            buildBinary(leftChild, depth + 1, 'Rama Izquierda', partner.id, 'left'),
+            buildBinary(rightChild, depth + 1, 'Rama Derecha', partner.id, 'right'),
+          ]
+        : [];
+
+      return {
+        key: partner.id,
+        partner,
+        binaryLeg,
+        legLabel: depth === 0 ? 'Tronco Principal' : legLabel,
+        depth,
+        hasChildren: true,
+        isExpanded: expanded,
+        totalDirectCount: (leftChild ? 1 : 0) + (rightChild ? 1 : 0),
+        children,
+        subtreeWidth: NODE_W,
+        x: 0,
+        y: 0,
+        centerX: 0,
+      };
+    };
+
+    const rootTree =
+      treeView === 'unilevel'
+        ? buildUnilevel(activeRootPartner, 0, 'Tronco Principal')
+        : buildBinary(activeRootPartner, 0, 'Tronco Principal');
+
+    // Bottom-up width calculation
+    let maxDepth = 0;
+    const measure = (node: VisualTreeNode): number => {
+      maxDepth = Math.max(maxDepth, node.depth);
+      if (node.children.length === 0) {
+        node.subtreeWidth = NODE_W;
+        return NODE_W;
+      }
+      const childrenTotal =
+        node.children.reduce((sum, child) => sum + measure(child), 0) +
+        H_GAP * (node.children.length - 1);
+      node.subtreeWidth = Math.max(NODE_W, childrenTotal);
+      return node.subtreeWidth;
+    };
+
+    measure(rootTree);
+
+    const flatNodes: VisualTreeNode[] = [];
+    const edges: TreeEdge[] = [];
+
+    const assign = (node: VisualTreeNode, leftX: number) => {
+      const centerX = leftX + node.subtreeWidth / 2;
+      node.centerX = centerX;
+      node.x = centerX - NODE_W / 2;
+      node.y = PAD_TOP + node.depth * (NODE_H + V_GAP);
+      flatNodes.push(node);
+
+      if (node.children.length > 0) {
+        const childrenSpan =
+          node.children.reduce((sum, c) => sum + c.subtreeWidth, 0) +
+          H_GAP * (node.children.length - 1);
+        let curX = centerX - childrenSpan / 2;
+        for (const child of node.children) {
+          assign(child, curX);
+          curX += child.subtreeWidth + H_GAP;
+
+          const childStatus: TreeEdge['status'] = !child.partner
+            ? 'empty'
+            : child.partner.status;
+          const isSelectedPath =
+            node.partner?.id === selectedPartner.id || child.partner?.id === selectedPartner.id;
+
+          edges.push({
+            id: `${node.key}__${child.key}`,
+            fromX: node.centerX,
+            fromY: node.y + NODE_H,
+            toX: child.centerX,
+            toY: child.y,
+            depth: node.depth,
+            status: childStatus,
+            isSelectedPath,
+          });
+        }
+      }
+    };
+
+    assign(rootTree, PAD_X);
+
+    const canvasWidth = Math.max(680, rootTree.subtreeWidth + PAD_X * 2);
+    const canvasHeight = PAD_TOP + (maxDepth + 1) * NODE_H + maxDepth * V_GAP + PAD_BOTTOM;
+
+    return {
+      rootTree,
+      flatNodes,
+      edges,
+      canvasWidth,
+      canvasHeight,
+    };
+  }, [partners, activeRootPartner, treeView, expandedNodes, selectedPartner.id]);
 
   const handleSavePii = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -132,6 +391,10 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
 
   const handleRecruitSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isPinSession) {
+      setRecruitError('Para registrar nuevos afiliados desde tu red, inicia sesión con tu cuenta de Google o solicita el alta al Administrador.');
+      return;
+    }
     if (recruitForm.fullName.trim().length < 2) {
       setRecruitError('Ingresa el nombre del nuevo socio.');
       return;
@@ -158,6 +421,11 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
         bankName: recruitForm.bankName,
         bankAccount: recruitForm.bankAccount,
       });
+      setExpandedNodes((prev) => ({
+        ...prev,
+        [sponsor.id]: true,
+        [recruitForm.binaryParentId || sponsor.id]: true,
+      }));
       setShowRecruitModal(false);
       setRecruitForm((prev) => ({ ...prev, fullName: '', email: '', ciNumber: '', bankAccount: '' }));
     } catch (err) {
@@ -167,128 +435,12 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
     }
   };
 
-  const renderUnilevelNode = (node: Partner, depth = 0): React.ReactNode => {
-    const children = partners.filter((p) => p.sponsorId === node.id);
-    const isExpanded = expandedNodes[node.id] ?? depth < 2;
-    const isSelected = selectedPartner.id === node.id;
-
-    return (
-      <div key={node.id} className={depth > 0 ? 'ml-6 pl-4 border-l border-slate-200' : ''}>
-        <div
-          className={`flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg border transition-colors mb-2 ${
-            isSelected
-              ? 'bg-slate-900 text-white border-slate-900'
-              : 'bg-white border-slate-200 hover:bg-slate-50 text-slate-900'
-          }`}
-        >
-          <div className="flex items-center gap-2.5 min-w-0">
-            {children.length > 0 ? (
-              <button
-                type="button"
-                onClick={() => toggleExpand(node.id)}
-                className={`p-1 rounded hover:bg-black/10 cursor-pointer ${
-                  isSelected ? 'text-white' : 'text-slate-500'
-                }`}
-                aria-label="Expandir o contraer nivel"
-              >
-                {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-              </button>
-            ) : (
-              <span className="w-6 shrink-0" />
-            )}
-            <button
-              type="button"
-              onClick={() => setSelectedPartnerId(node.id)}
-              className="text-left min-w-0 cursor-pointer"
-            >
-              <div className="text-sm font-semibold truncate">{node.fullName}</div>
-              <div
-                className={`text-xs flex items-center gap-1.5 ${
-                  isSelected ? 'text-slate-300' : 'text-slate-500'
-                }`}
-              >
-                <span>{RANK_MAP[node.rankId]?.name}</span>
-                <span aria-hidden="true">·</span>
-                <span>{AFFILIATION_PACKAGES[node.packageTier].name}</span>
-                <span aria-hidden="true">·</span>
-                <span className="font-mono-num">{node.referralCode}</span>
-              </div>
-            </button>
-          </div>
-          <div className="text-right shrink-0">
-            <div className="text-xs font-mono-num font-semibold">
-              {node.personalPv} PV / {node.teamCv.toLocaleString('es-BO')} CV
-            </div>
-            <div
-              className={`text-[11px] font-medium ${
-                isSelected
-                  ? 'text-slate-300'
-                  : node.status === 'activo'
-                  ? 'text-[#15803D]'
-                  : node.status === 'pendiente'
-                  ? 'text-[#B45309]'
-                  : 'text-red-600'
-              }`}
-            >
-              {node.status === 'activo'
-                ? 'Activo'
-                : node.status === 'pendiente'
-                ? 'Pendiente'
-                : 'Inactivo'}
-              {' · '}
-              {children.length} directos
-            </div>
-          </div>
-        </div>
-        {isExpanded && children.map((child) => renderUnilevelNode(child, depth + 1))}
-      </div>
-    );
-  };
-
-  const renderBinaryTree = (node: Partner | undefined, legLabel: string, depth = 0): React.ReactNode => {
-    if (!node) {
-      return (
-        <div className="border border-dashed border-slate-300 rounded-lg p-3 text-center text-xs text-slate-400 bg-slate-50/50">
-          Posición {legLabel} disponible
-        </div>
-      );
-    }
-    const leftChild = partners.find((p) => p.binaryParentId === node.id && p.binaryLeg === 'left');
-    const rightChild = partners.find((p) => p.binaryParentId === node.id && p.binaryLeg === 'right');
-
-    return (
-      <div className="flex flex-col items-center w-full">
-        <button
-          type="button"
-          onClick={() => setSelectedPartnerId(node.id)}
-          className={`w-full max-w-[230px] p-3 rounded-lg border text-left transition-colors cursor-pointer ${
-            selectedPartner.id === node.id
-              ? 'bg-slate-900 text-white border-slate-900'
-              : 'bg-white border-slate-200 hover:border-slate-300 text-slate-900'
-          }`}
-        >
-          <div className="text-[11px] opacity-75 mb-0.5">
-            {legLabel} · {AFFILIATION_PACKAGES[node.packageTier].name}
-          </div>
-          <div className="text-sm font-semibold truncate">{node.fullName}</div>
-          <div className="mt-1.5 flex items-center justify-between text-xs font-mono-num">
-            <span>{RANK_MAP[node.rankId]?.name}</span>
-            <span>{node.personalPv} PV</span>
-          </div>
-          <div className="mt-1 text-[11px] font-mono-num opacity-80 flex justify-between">
-            <span>Izq: {node.leftBranchCv.toLocaleString('es-BO')}</span>
-            <span>Der: {node.rightBranchCv.toLocaleString('es-BO')}</span>
-          </div>
-        </button>
-
-        {depth < 2 && (
-          <div className="grid grid-cols-2 gap-3 w-full mt-3 pt-3 border-t border-slate-200">
-            <div>{renderBinaryTree(leftChild, 'Izquierda', depth + 1)}</div>
-            <div>{renderBinaryTree(rightChild, 'Derecha', depth + 1)}</div>
-          </div>
-        )}
-      </div>
-    );
+  const getEdgeStroke = (edge: TreeEdge): string => {
+    if (edge.status === 'empty') return '#CBD5E1';
+    if (edge.isSelectedPath) return '#8B1E24';
+    if (edge.status === 'activo') return '#15803D';
+    if (edge.status === 'pendiente') return '#D97706';
+    return '#94A3B8';
   };
 
   return (
@@ -296,12 +448,14 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
       {/* Header Row */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">Red Multinivel y Socios</h1>
+          <h1 className="text-2xl font-bold text-slate-900">
+            {isAdmin ? 'Árbol Global de Red Multinivel' : 'Mi Red Multinivel y Ramas'}
+          </h1>
           <p className="text-sm text-slate-500">
-            Árbol unilevel, estructura binaria izquierda/derecha, referidos directos y perfiles de red.
+            Visualización orgánica en árbol con ramas de patrocinio unilevel y estructura binaria izquierda/derecha.
           </p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg border border-slate-200">
             <button
               type="button"
@@ -310,7 +464,7 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
                 treeView === 'unilevel' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              Árbol Unilevel
+              Árbol de Patrocinio
             </button>
             <button
               type="button"
@@ -319,12 +473,12 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
                 treeView === 'binary' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              Estructura Binaria
+              Árbol Binario (Izq / Der)
             </button>
           </div>
           <button
             type="button"
-            onClick={() => setShowRecruitModal(true)}
+            onClick={() => openRecruitForSlot(selectedPartner.id, 'left')}
             className="inline-flex items-center gap-2 px-4 py-2 bg-[#8B1E24] text-white text-xs font-semibold rounded-lg hover:bg-[#73181D] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <UserPlus className="w-4 h-4" />
@@ -370,59 +524,299 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
         </div>
       </div>
 
-      {/* Main Split: Tree + Selected Partner Inspector */}
+      {/* Main Split: Tree Canvas + Selected Partner Inspector */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        <div className="lg:col-span-8 bg-white border border-slate-200 rounded-xl p-6">
-          <div className="flex items-center justify-between gap-4 mb-5">
-            <div className="flex items-center gap-2">
+        <div className="lg:col-span-8 bg-white border border-slate-200 rounded-xl overflow-hidden">
+          {/* Tree Toolbar */}
+          <div className="px-5 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
               {treeView === 'unilevel' ? (
-                <Network className="w-4 h-4 text-[#8B1E24]" />
+                <Network className="w-4 h-4 text-[#8B1E24] shrink-0" />
               ) : (
-                <GitBranch className="w-4 h-4 text-[#8B1E24]" />
+                <GitBranch className="w-4 h-4 text-[#8B1E24] shrink-0" />
               )}
-              <h2 className="text-base font-semibold text-slate-900">
-                {treeView === 'unilevel'
-                  ? 'Árbol Jerárquico de Patrocinio'
-                  : `Árbol Binario desde ${selectedPartner.fullName}`}
-              </h2>
+              <div className="min-w-0">
+                <h2 className="text-sm font-semibold text-slate-900 truncate">
+                  {treeView === 'unilevel' ? 'Árbol y Ramas de Patrocinio' : 'Árbol Binario con Ramas'} ·{' '}
+                  <span className="text-[#8B1E24]">{activeRootPartner.fullName}</span>
+                </h2>
+                <div className="text-[11px] text-slate-500 flex items-center gap-3 flex-wrap">
+                  <span>Rama Activa (Verde)</span>
+                  <span aria-hidden="true">·</span>
+                  <span>Nodo Seleccionado (Carmesí)</span>
+                  <span aria-hidden="true">·</span>
+                  <span>Pendiente (Ámbar)</span>
+                </div>
+              </div>
             </div>
-            {selectedPartner.id !== currentPartner.id && (
+
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {activeRootPartner.id !== defaultRootId && (
+                <button
+                  type="button"
+                  onClick={() => setRootPartnerId(defaultRootId)}
+                  className="px-2.5 py-1.5 text-xs font-medium text-[#8B1E24] border border-[#8B1E24]/30 rounded-lg hover:bg-red-50 whitespace-nowrap cursor-pointer"
+                >
+                  Volver a raíz
+                </button>
+              )}
               <button
                 type="button"
-                onClick={() => setSelectedPartnerId(currentPartner.id)}
-                className="text-xs font-medium text-[#8B1E24] hover:underline whitespace-nowrap cursor-pointer"
+                onClick={handleExpandAll}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap cursor-pointer"
+                title="Expandir todas las ramas"
               >
-                Volver a mi nodo
+                <Maximize2 className="w-3.5 h-3.5" />
+                <span>Expandir</span>
               </button>
-            )}
+              <button
+                type="button"
+                onClick={handleCollapseToRoot}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap cursor-pointer"
+                title="Contraer ramas"
+              >
+                <Minimize2 className="w-3.5 h-3.5" />
+                <span>Contraer</span>
+              </button>
+              <div className="inline-flex items-center border border-slate-200 rounded-lg bg-slate-50">
+                <button
+                  type="button"
+                  onClick={() => setZoom((z) => Math.max(0.65, Math.round((z - 0.1) * 100) / 100))}
+                  className="p-1.5 text-slate-600 hover:text-slate-900 cursor-pointer"
+                  aria-label="Alejar árbol"
+                >
+                  <ZoomOut className="w-3.5 h-3.5" />
+                </button>
+                <span className="px-2 text-[11px] font-mono-num text-slate-700">
+                  {Math.round(zoom * 100)}%
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setZoom((z) => Math.min(1.25, Math.round((z + 0.1) * 100) / 100))}
+                  className="p-1.5 text-slate-600 hover:text-slate-900 cursor-pointer"
+                  aria-label="Acercar árbol"
+                >
+                  <ZoomIn className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
           </div>
 
-          {treeView === 'unilevel' ? (
-            <div className="space-y-1">
-              {renderUnilevelNode(
-                partners.find((p) => p.id === 'vn_root') || currentPartner,
-                0
-              )}
-              {partners
-                .filter(
-                  (p) =>
-                    p.id !== 'vn_root' &&
-                    !partners.some((parent) => parent.id === p.sponsorId)
-                )
-                .map((orphan) => renderUnilevelNode(orphan, 0))}
+          {/* Interactive Tree & Branches Canvas */}
+          <div className="overflow-auto bg-slate-50/70 p-4 min-h-[440px] max-h-[640px]">
+            <div
+              style={{
+                width: treeLayout.canvasWidth * zoom,
+                height: treeLayout.canvasHeight * zoom,
+              }}
+              className="mx-auto relative"
+            >
+              <div
+                style={{
+                  width: treeLayout.canvasWidth,
+                  height: treeLayout.canvasHeight,
+                  transform: `scale(${zoom})`,
+                  transformOrigin: 'top left',
+                }}
+                className="relative"
+              >
+                {/* SVG Branches Layer */}
+                <svg
+                  width={treeLayout.canvasWidth}
+                  height={treeLayout.canvasHeight}
+                  className="absolute inset-0 pointer-events-none"
+                >
+                  {/* Root trunk stem */}
+                  <line
+                    x1={treeLayout.rootTree.centerX}
+                    y1={10}
+                    x2={treeLayout.rootTree.centerX}
+                    y2={treeLayout.rootTree.y}
+                    stroke="#8B1E24"
+                    strokeWidth={3.5}
+                    strokeLinecap="round"
+                  />
+                  <circle cx={treeLayout.rootTree.centerX} cy={10} r={4} fill="#8B1E24" />
+
+                  {/* Curved Tree Branches */}
+                  {treeLayout.edges.map((edge) => {
+                    const midY = edge.fromY + (edge.toY - edge.fromY) * 0.52;
+                    const pathD = `M ${edge.fromX} ${edge.fromY} C ${edge.fromX} ${midY}, ${edge.toX} ${midY}, ${edge.toX} ${edge.toY}`;
+                    const strokeColor = getEdgeStroke(edge);
+                    const strokeWidth =
+                      edge.status === 'empty'
+                        ? 1.75
+                        : Math.max(1.75, 3.25 - edge.depth * 0.45);
+
+                    return (
+                      <g key={edge.id}>
+                        <path
+                          d={pathD}
+                          fill="none"
+                          stroke={strokeColor}
+                          strokeWidth={strokeWidth}
+                          strokeDasharray={edge.status === 'empty' ? '5 5' : undefined}
+                          strokeLinecap="round"
+                        />
+                        <circle
+                          cx={edge.fromX}
+                          cy={edge.fromY}
+                          r={3.5}
+                          fill={edge.isSelectedPath ? '#8B1E24' : '#64748B'}
+                        />
+                        <circle
+                          cx={edge.toX}
+                          cy={edge.toY}
+                          r={3.5}
+                          fill={edge.status === 'empty' ? '#CBD5E1' : strokeColor}
+                        />
+                      </g>
+                    );
+                  })}
+                </svg>
+
+                {/* Tree Nodes Layer */}
+                {treeLayout.flatNodes.map((node) => {
+                  if (!node.partner) {
+                    // Empty Binary Branch Slot
+                    return (
+                      <button
+                        key={node.key}
+                        type="button"
+                        onClick={() =>
+                          node.parentPartnerId &&
+                          node.binaryLeg &&
+                          openRecruitForSlot(node.parentPartnerId, node.binaryLeg)
+                        }
+                        style={{
+                          left: node.x,
+                          top: node.y,
+                          width: NODE_W,
+                          height: NODE_H,
+                        }}
+                        className="absolute rounded-xl border border-dashed border-slate-300 bg-white/85 hover:border-[#8B1E24] hover:bg-red-50/30 p-3 flex flex-col items-center justify-center text-center transition-colors cursor-pointer"
+                      >
+                        <Plus className="w-4 h-4 text-slate-400 mb-1" />
+                        <span className="text-xs font-semibold text-slate-700">{node.legLabel}</span>
+                        <span className="text-[11px] text-slate-400 mt-0.5">
+                          Posición disponible · Afiliar
+                        </span>
+                      </button>
+                    );
+                  }
+
+                  const p = node.partner;
+                  const isSelected = selectedPartner.id === p.id;
+                  const isRootNode = node.depth === 0;
+                  const rankName = RANK_MAP[p.rankId]?.name || p.rankId;
+                  const statusLabel =
+                    p.status === 'activo'
+                      ? 'Activo'
+                      : p.status === 'pendiente'
+                      ? 'Pendiente'
+                      : 'Inactivo';
+                  const statusColor = isSelected
+                    ? 'text-amber-200'
+                    : p.status === 'activo'
+                    ? 'text-[#15803D]'
+                    : p.status === 'pendiente'
+                    ? 'text-[#B45309]'
+                    : 'text-red-600';
+
+                  return (
+                    <div
+                      key={node.key}
+                      style={{
+                        left: node.x,
+                        top: node.y,
+                        width: NODE_W,
+                        height: NODE_H,
+                      }}
+                      className="absolute"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setSelectedPartnerId(p.id)}
+                        className={`w-full h-full rounded-xl border p-3 text-left transition-colors flex flex-col justify-between cursor-pointer ${
+                          isSelected
+                            ? 'bg-[#8B1E24] text-white border-[#73181D] shadow-md'
+                            : isRootNode
+                            ? 'bg-slate-900 text-white border-slate-900 shadow-sm'
+                            : 'bg-white text-slate-900 border-slate-200 hover:border-[#8B1E24]/60 shadow-xs'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2 text-[10px]">
+                          <span
+                            className={`truncate font-medium ${
+                              isSelected || isRootNode ? 'text-white/80' : 'text-slate-500'
+                            }`}
+                          >
+                            {node.legLabel}
+                          </span>
+                          <span className={`font-semibold shrink-0 ${statusColor}`}>
+                            {statusLabel}
+                          </span>
+                        </div>
+
+                        <div className="min-w-0">
+                          <div className="text-xs font-bold truncate">{p.fullName}</div>
+                          <div
+                            className={`text-[11px] truncate ${
+                              isSelected || isRootNode ? 'text-white/75' : 'text-slate-500'
+                            }`}
+                          >
+                            {rankName} · {AFFILIATION_PACKAGES[p.packageTier].name}
+                          </div>
+                        </div>
+
+                        <div
+                          className={`pt-1.5 border-t flex items-center justify-between text-[11px] font-mono-num ${
+                            isSelected || isRootNode
+                              ? 'border-white/15 text-white/90'
+                              : 'border-slate-100 text-slate-700'
+                          }`}
+                        >
+                          <span>{p.personalPv} PV</span>
+                          <span>
+                            {treeView === 'binary'
+                              ? `I:${p.leftBranchCv} · D:${p.rightBranchCv}`
+                              : `${p.teamCv.toLocaleString('es-BO')} CV`}
+                          </span>
+                        </div>
+                      </button>
+
+                      {/* Branch Expand / Collapse Junction Button */}
+                      {node.hasChildren && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleExpand(p.id, node.depth);
+                          }}
+                          title={node.isExpanded ? 'Contraer ramas' : 'Expandir ramas'}
+                          className="absolute -bottom-3 left-1/2 -translate-x-1/2 z-10 inline-flex items-center gap-0.5 px-2 py-0.5 rounded-full bg-white border border-slate-300 text-[10px] font-mono-num font-semibold text-slate-700 hover:border-[#8B1E24] hover:text-[#8B1E24] shadow-xs cursor-pointer"
+                        >
+                          {node.isExpanded ? (
+                            <ChevronDown className="w-3 h-3" />
+                          ) : (
+                            <ChevronRight className="w-3 h-3" />
+                          )}
+                          <span>{node.totalDirectCount}</span>
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
-          ) : (
-            <div className="overflow-x-auto pb-2">
-              {renderBinaryTree(selectedPartner, 'Nodo Base', 0)}
-            </div>
-          )}
+          </div>
         </div>
 
         {/* Selected Node Details & Personal PII */}
         <div className="lg:col-span-4 space-y-6">
           <div className="bg-white border border-slate-200 rounded-xl p-6">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-base font-semibold text-slate-900">Detalle del Socio</h3>
+              <h3 className="text-base font-semibold text-slate-900">Detalle del Nodo</h3>
               <span
                 className={`text-xs font-medium ${
                   selectedPartner.status === 'activo'
@@ -470,6 +864,18 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
                   </div>
                 </div>
               </div>
+
+              {selectedPartner.id !== activeRootPartner.id && (
+                <button
+                  type="button"
+                  onClick={() => setRootPartnerId(selectedPartner.id)}
+                  className="w-full mt-2 py-2 px-3 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 hover:border-[#8B1E24] hover:text-[#8B1E24] flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <Focus className="w-3.5 h-3.5" />
+                  <span>Enfocar árbol desde este socio</span>
+                </button>
+              )}
+
               <div className="pt-2 border-t border-slate-100">
                 <div className="text-xs text-slate-500 mb-1.5">Referidos Directos ({directReferrals.length})</div>
                 {directReferrals.length === 0 ? (
@@ -501,14 +907,21 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
                 <UserCheck className="w-4 h-4 text-[#8B1E24]" />
                 <h3 className="text-sm font-semibold text-slate-900">Mi Perfil Privado y Cuenta</h3>
               </div>
-              <button
-                type="button"
-                onClick={() => setEditingPii((v) => !v)}
-                className="text-xs font-medium text-[#8B1E24] hover:underline cursor-pointer"
-              >
-                {editingPii ? 'Cancelar' : 'Editar'}
-              </button>
+              {!isPinSession && (
+                <button
+                  type="button"
+                  onClick={() => setEditingPii((v) => !v)}
+                  className="text-xs font-medium text-[#8B1E24] hover:underline cursor-pointer"
+                >
+                  {editingPii ? 'Cancelar' : 'Editar'}
+                </button>
+              )}
             </div>
+            {isPinSession && (
+              <div className="mb-3 p-2.5 bg-slate-50 border border-slate-200 rounded text-[11px] text-slate-600">
+                Ingresaste con acceso rápido por PIN. Los datos privados (correo, CI y cuenta bancaria) permanecen protegidos.
+              </div>
+            )}
             {piiStatus && (
               <div className="mb-3 p-2 bg-emerald-50 border border-emerald-200 rounded text-xs text-emerald-800">
                 {piiStatus}
@@ -622,7 +1035,10 @@ export const NetworkModule: React.FC<NetworkModuleProps> = ({
               {filteredPartners.map((p) => (
                 <tr
                   key={p.id}
-                  onClick={() => setSelectedPartnerId(p.id)}
+                  onClick={() => {
+                    setSelectedPartnerId(p.id);
+                    setRootPartnerId(p.id);
+                  }}
                   className="hover:bg-slate-50 cursor-pointer transition-colors"
                 >
                   <td className="py-2.5 px-3 font-medium text-slate-900">{p.fullName}</td>

@@ -1,8 +1,11 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { signInWithPopup } from 'firebase/auth';
 import {
   ArrowRight,
+  CheckCircle2,
   Compass,
+  KeyRound,
+  LogOut,
   Package,
   Search,
   Shield,
@@ -17,16 +20,20 @@ import { auth, googleProvider } from '../firebase';
 import { AFFILIATION_PACKAGES, SOLID_GROWTH_GUARANTEES } from '../data/compensationPlan';
 import type { BinaryLeg, PackageTier, Partner, Product } from '../types/vivenext';
 
-export type LoginRoleIntent = 'admin' | 'socio';
+export type LoginAccessMode = 'affiliate' | 'admin';
 
 interface AuthGateProps {
-  mode: 'login' | 'onboarding';
+  mode: 'login' | 'onboarding' | 'admin_denied';
   userEmail?: string;
   userName?: string;
   userUid?: string;
   rootPartner?: Partner | null;
   marketplaceProducts?: Product[];
-  onSelectLoginIntent?: (intent: LoginRoleIntent) => void;
+  initialLoginError?: string;
+  onSelectLoginMode?: (mode: LoginAccessMode) => void;
+  onLoginWithPin?: (pin: string) => Promise<void>;
+  onSwitchToAffiliateMode?: () => void;
+  onSignOut?: () => Promise<void> | void;
   onCompleteOnboarding?: (payload: {
     fullName: string;
     sponsorId: string;
@@ -40,91 +47,33 @@ interface AuthGateProps {
   }) => Promise<void>;
 }
 
-const FALLBACK_PUBLIC_PRODUCTS: Array<
-  Pick<
-    Product,
-    'id' | 'sku' | 'name' | 'category' | 'retailPriceBs' | 'wholesalePriceBs' | 'pv' | 'cv' | 'stock' | 'imageUrl' | 'description'
-  >
-> = [
-  {
-    id: 'pkg_elite',
-    sku: 'VN-PKG-ELITE',
-    name: 'Paquete Emprendedor Élite',
-    category: 'Paquetes de Afiliación',
-    retailPriceBs: 4500,
-    wholesalePriceBs: 3000,
-    pv: 300,
-    cv: 240,
-    stock: 120,
-    imageUrl: '/src/assets/images/product_elixir_vital_1794920091552.jpg',
-    description: 'Acceso completo a los 9 bonos del Plan de Prosperidad, binario híbrido y premios de liderazgo.',
-  },
-  {
-    id: 'prod_elixir',
-    sku: 'VN-ELX-01',
-    name: 'Elixir Botánico Vital',
-    category: 'Bienestar Celular',
-    retailPriceBs: 360,
-    wholesalePriceBs: 240,
-    pv: 45,
-    cv: 36,
-    stock: 140,
-    imageUrl: '/src/assets/images/product_elixir_vital_1794920091552.jpg',
-    description: 'Concentrado botánico antioxidante de alta absorción para vitalidad diaria e inmunidad celular.',
-  },
-  {
-    id: 'prod_colageno',
-    sku: 'VN-COL-02',
-    name: 'Colágeno Hidrolizado Next',
-    category: 'Nutrición Avanzada',
-    retailPriceBs: 450,
-    wholesalePriceBs: 300,
-    pv: 55,
-    cv: 44,
-    stock: 96,
-    imageUrl: '/src/assets/images/product_colageno_next_1794920093968.jpg',
-    description: 'Péptidos bioactivos de colágeno tipo I y III con vitamina C orgánica para articulaciones y piel.',
-  },
-  {
-    id: 'prod_matcha',
-    sku: 'VN-MTC-03',
-    name: 'Superfood Matcha Energía',
-    category: 'Energía y Enfoque',
-    retailPriceBs: 330,
-    wholesalePriceBs: 220,
-    pv: 40,
-    cv: 32,
-    stock: 112,
-    imageUrl: '/src/assets/images/product_energia_matcha_1794920092488.jpg',
-    description: 'Fórmula adaptógena de matcha ceremonial y guaraná amazónico para energía limpia sostenida.',
-  },
-  {
-    id: 'prod_omega',
-    sku: 'VN-OMG-04',
-    name: 'Omega-3 Pure Cellular',
-    category: 'Salud Cardiovascular',
-    retailPriceBs: 390,
-    wholesalePriceBs: 260,
-    pv: 50,
-    cv: 40,
-    stock: 84,
-    imageUrl: '/src/assets/images/product_omega_pure_1794920093366.jpg',
-    description: 'Ácidos grasos esenciales EPA/DHA purificados molecularmente para función cerebral y cardiovascular.',
-  },
-];
-
 export const AuthGate: React.FC<AuthGateProps> = ({
   mode,
   userEmail,
   userName,
   marketplaceProducts = [],
-  onSelectLoginIntent,
+  initialLoginError = '',
+  onSelectLoginMode,
+  onLoginWithPin,
+  onSwitchToAffiliateMode,
+  onSignOut,
   onCompleteOnboarding,
 }) => {
-  const [loadingIntent, setLoadingIntent] = useState<LoginRoleIntent | null>(null);
-  const [error, setError] = useState('');
+  const [loggingIn, setLoggingIn] = useState(false);
+  const [pinBusy, setPinBusy] = useState(false);
+  const [pinInput, setPinInput] = useState('');
+  const [error, setError] = useState(initialLoginError);
   const [bannerImgFailed, setBannerImgFailed] = useState(false);
-  const [showLoginModal, setShowLoginModal] = useState(false);
+  const [showLoginModal, setShowLoginModal] = useState(Boolean(initialLoginError));
+  const [selectedLoginMode, setSelectedLoginMode] = useState<LoginAccessMode>('affiliate');
+
+  useEffect(() => {
+    if (initialLoginError) {
+      setError(initialLoginError);
+      setShowLoginModal(true);
+      setSelectedLoginMode('affiliate');
+    }
+  }, [initialLoginError]);
 
   // Marketplace preview filters
   const [marketCategory, setMarketCategory] = useState('Todas');
@@ -143,8 +92,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({
   const [onboardingBusy, setOnboardingBusy] = useState(false);
 
   const visibleCatalog = useMemo(() => {
-    const activeFromDb = marketplaceProducts.filter((p) => p.active);
-    return activeFromDb.length > 0 ? activeFromDb : FALLBACK_PUBLIC_PRODUCTS;
+    return marketplaceProducts.filter((p) => p.active);
   }, [marketplaceProducts]);
 
   const marketCategories = useMemo(() => {
@@ -166,16 +114,58 @@ export const AuthGate: React.FC<AuthGateProps> = ({
     });
   }, [visibleCatalog, marketCategory, marketSearch]);
 
-  const handleRoleLogin = async (intent: LoginRoleIntent) => {
+  const handleGoogleLogin = async (accessMode: LoginAccessMode = selectedLoginMode) => {
     setError('');
-    setLoadingIntent(intent);
-    onSelectLoginIntent?.(intent);
+    setLoggingIn(true);
     try {
+      onSelectLoginMode?.(accessMode);
+      googleProvider.setCustomParameters({ prompt: 'select_account' });
       await signInWithPopup(auth, googleProvider);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'No se pudo iniciar sesión con Google.');
+    } catch (err: unknown) {
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: string }).code)
+          : '';
+      if (code === 'auth/popup-blocked') {
+        setError('El navegador bloqueó la ventana de Google. Permite las ventanas emergentes e intenta nuevamente.');
+      } else if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        setError('Se cerró la ventana de inicio de sesión antes de completar el ingreso.');
+      } else if (code === 'auth/unauthorized-domain') {
+        setError('Este dominio no está autorizado en Firebase Auth.');
+      } else {
+        setError(err instanceof Error ? err.message : 'No se pudo iniciar sesión con Google.');
+      }
     } finally {
-      setLoadingIntent(null);
+      setLoggingIn(false);
+    }
+  };
+
+  const handlePinSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!onLoginWithPin) return;
+    const clean = pinInput.trim().toUpperCase();
+    if (clean.length < 4) {
+      setError('Ingresa el PIN de acceso rápido (mínimo 4 caracteres).');
+      return;
+    }
+    setError('');
+    setPinBusy(true);
+    try {
+      await onLoginWithPin(clean);
+    } catch (err: unknown) {
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: string }).code)
+          : '';
+      if (code === 'auth/popup-blocked') {
+        setError('El navegador bloqueó la ventana de Google. Permite las ventanas emergentes e intenta nuevamente.');
+      } else if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        setError('Se cerró la confirmación de Google antes de validar el PIN.');
+      } else {
+        setError(err instanceof Error ? err.message : 'PIN inválido o no autorizado.');
+      }
+    } finally {
+      setPinBusy(false);
     }
   };
 
@@ -207,19 +197,103 @@ export const AuthGate: React.FC<AuthGateProps> = ({
     }
   };
 
+  if (mode === 'admin_denied') {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+        <div className="max-w-md w-full bg-white border border-slate-200 rounded-xl p-8 space-y-5">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-red-50 text-[#8B1E24] flex items-center justify-center shrink-0">
+              <Shield className="w-5 h-5" />
+            </div>
+            <div>
+              <h1 className="text-lg font-bold text-slate-900">Acceso exclusivo de Administrador</h1>
+              <p className="text-xs text-slate-500">{userEmail}</p>
+            </div>
+          </div>
+
+          <p className="text-sm text-slate-600 leading-relaxed">
+            Esta cuenta de Google no tiene permisos de Administrador. Puedes ingresar a tu{' '}
+            <strong className="text-slate-900">Panel de Afiliado</strong> con esta misma cuenta o
+            cambiar de cuenta de Google.
+          </p>
+
+          <div className="space-y-2.5 pt-1">
+            <button
+              type="button"
+              onClick={() => onSwitchToAffiliateMode?.()}
+              className="w-full py-2.5 px-4 bg-[#8B1E24] text-white text-sm font-semibold rounded-lg hover:bg-[#73181D] transition-colors flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <UserCheck className="w-4 h-4" />
+              <span>Entrar en Modo Afiliado con esta cuenta</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onSignOut?.()}
+              className="w-full py-2.5 px-4 border border-slate-200 text-slate-700 text-sm font-medium rounded-lg hover:bg-slate-50 transition-colors flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <LogOut className="w-4 h-4" />
+              <span>Cambiar de cuenta Google</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (mode === 'onboarding') {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
         <div className="max-w-2xl w-full bg-white border border-slate-200 rounded-xl p-8">
-          <div className="flex items-center gap-3 mb-2">
-            <div className="w-9 h-9 rounded-lg bg-[#8B1E24] text-white flex items-center justify-center">
-              <UserPlus className="w-5 h-5" />
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-2">
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-lg bg-[#8B1E24] text-white flex items-center justify-center shrink-0">
+                <UserPlus className="w-5 h-5" />
+              </div>
+              <div>
+                <h1 className="text-xl font-bold text-slate-900">Alta de Nuevo Afiliado Vive Next</h1>
+                <p className="text-xs text-slate-500">{userEmail} · Vinculación de patrocinador y paquete inicial</p>
+              </div>
             </div>
-            <div>
-              <h1 className="text-xl font-bold text-slate-900">Alta de Nuevo Afiliado Vive Next</h1>
-              <p className="text-xs text-slate-500">{userEmail} · Vinculación de patrocinador y paquete inicial</p>
-            </div>
+            {onSignOut && (
+              <button
+                type="button"
+                onClick={() => onSignOut()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-600 border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Cambiar cuenta</span>
+              </button>
+            )}
           </div>
+
+          {onLoginWithPin && (
+            <form
+              onSubmit={handlePinSubmit}
+              className="mt-5 p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3"
+            >
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-900">
+                <KeyRound className="w-4 h-4 text-[#8B1E24]" />
+                <span>¿El Administrador te dio un PIN de acceso rápido?</span>
+              </div>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input
+                  type="text"
+                  maxLength={16}
+                  value={pinInput}
+                  onChange={(e) => setPinInput(e.target.value.toUpperCase())}
+                  placeholder="Ingresa tu PIN (ej. 482915)"
+                  className="flex-1 px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white font-mono-num font-bold tracking-widest focus:outline-none focus:border-[#8B1E24]"
+                />
+                <button
+                  type="submit"
+                  disabled={pinBusy}
+                  className="px-4 py-2 bg-[#8B1E24] text-white text-xs font-semibold rounded-lg hover:bg-[#73181D] disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {pinBusy ? 'Verificando PIN...' : 'Entrar rápido con PIN'}
+                </button>
+              </div>
+            </form>
+          )}
 
           <form onSubmit={handleOnboardingSubmit} className="mt-6 space-y-5">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -680,7 +754,9 @@ export const AuthGate: React.FC<AuthGateProps> = ({
 
           {filteredCatalog.length === 0 ? (
             <div className="bg-white border border-slate-200 rounded-xl p-10 text-center text-sm text-slate-500">
-              No hay productos que coincidan con tu búsqueda en este momento.
+              {visibleCatalog.length === 0
+                ? 'El catálogo del Marketplace se encuentra limpio. El Administrador publicará los productos oficiales aquí.'
+                : 'No hay productos que coincidan con tu búsqueda en este momento.'}
             </div>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -750,7 +826,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({
               <div>
                 <h2 className="font-display text-lg font-bold text-slate-900">Iniciar Sesión en Vive Next</h2>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Selecciona el panel con el que deseas ingresar mediante Google.
+                  Elige el modo de acceso: entra directo solo con tu PIN de afiliado o con tu cuenta de Google.
                 </p>
               </div>
               <button
@@ -763,53 +839,143 @@ export const AuthGate: React.FC<AuthGateProps> = ({
               </button>
             </div>
 
+            <div className="grid grid-cols-1 gap-2.5 text-xs">
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedLoginMode('affiliate');
+                  setError('');
+                }}
+                className={`w-full text-left p-3.5 rounded-xl border transition-colors flex items-start justify-between gap-3 cursor-pointer ${
+                  selectedLoginMode === 'affiliate'
+                    ? 'bg-red-50/50 border-[#8B1E24]'
+                    : 'bg-slate-50 border-slate-200 hover:border-slate-300'
+                }`}
+              >
+                <div className="flex items-start gap-2.5">
+                  <UserCheck
+                    className={`w-4 h-4 shrink-0 mt-0.5 ${
+                      selectedLoginMode === 'affiliate' ? 'text-[#8B1E24]' : 'text-slate-700'
+                    }`}
+                  />
+                  <div>
+                    <div className="font-semibold text-slate-900">Entrar en Modo Afiliado</div>
+                    <div className="text-slate-500 mt-0.5">
+                      Accede directo al Panel de Afiliado poniendo solo tu PIN o con tu cuenta de Google.
+                    </div>
+                  </div>
+                </div>
+                {selectedLoginMode === 'affiliate' && (
+                  <CheckCircle2 className="w-4 h-4 text-[#8B1E24] shrink-0 mt-0.5" />
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedLoginMode('admin');
+                  setError('');
+                }}
+                className={`w-full text-left p-3.5 rounded-xl border transition-colors flex items-start justify-between gap-3 cursor-pointer ${
+                  selectedLoginMode === 'admin'
+                    ? 'bg-red-50/50 border-[#8B1E24]'
+                    : 'bg-slate-50 border-slate-200 hover:border-slate-300'
+                }`}
+              >
+                <div className="flex items-start gap-2.5">
+                  <Shield
+                    className={`w-4 h-4 shrink-0 mt-0.5 ${
+                      selectedLoginMode === 'admin' ? 'text-[#8B1E24]' : 'text-slate-700'
+                    }`}
+                  />
+                  <div>
+                    <div className="font-semibold text-slate-900">Entrar en Modo Administrador</div>
+                    <div className="text-slate-500 mt-0.5">
+                      Accede exclusivamente al Panel de Administrador (afiliados, productos, pagos y red).
+                    </div>
+                  </div>
+                </div>
+                {selectedLoginMode === 'admin' && (
+                  <CheckCircle2 className="w-4 h-4 text-[#8B1E24] shrink-0 mt-0.5" />
+                )}
+              </button>
+            </div>
+
             {error && (
               <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700">
                 {error}
               </div>
             )}
 
-            <div className="space-y-3">
-              <button
-                type="button"
-                onClick={() => handleRoleLogin('admin')}
-                disabled={loadingIntent !== null}
-                className="w-full p-4 rounded-xl bg-[#8B1E24] text-white hover:bg-[#73181D] transition-colors flex items-center justify-between gap-3 text-left cursor-pointer disabled:opacity-50"
+            {selectedLoginMode === 'affiliate' && onLoginWithPin && (
+              <form
+                onSubmit={handlePinSubmit}
+                className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3"
               >
-                <div className="flex items-center gap-3">
-                  <Shield className="w-5 h-5 shrink-0" />
-                  <div>
-                    <div className="text-sm font-semibold">
-                      {loadingIntent === 'admin' ? 'Conectando...' : 'Ingresar como Administrador'}
-                    </div>
-                    <div className="text-[11px] text-red-100">
-                      Control total, socios, pedidos y subida de productos
-                    </div>
-                  </div>
+                <div className="flex items-center gap-2 text-xs font-semibold text-slate-900">
+                  <KeyRound className="w-4 h-4 text-[#8B1E24]" />
+                  <span>Ingreso Rápido con PIN de Afiliado</span>
                 </div>
-                <ArrowRight className="w-4 h-4 shrink-0" />
-              </button>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    maxLength={16}
+                    value={pinInput}
+                    onChange={(e) => {
+                      setPinInput(e.target.value.toUpperCase());
+                      setError('');
+                    }}
+                    placeholder="PIN (ej. 482915)"
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white font-mono-num font-bold tracking-widest focus:outline-none focus:border-[#8B1E24]"
+                  />
+                  <button
+                    type="submit"
+                    disabled={pinBusy || loggingIn}
+                    className="px-4 py-2 bg-[#8B1E24] text-white text-xs font-semibold rounded-lg hover:bg-[#73181D] disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    {pinBusy ? 'Validando...' : 'Entrar con PIN'}
+                  </button>
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  Acceso directo sin abrir Google: solo escribe el PIN que te entregó el Administrador para entrar a tu oficina.
+                </p>
+              </form>
+            )}
 
-              <button
-                type="button"
-                onClick={() => handleRoleLogin('socio')}
-                disabled={loadingIntent !== null}
-                className="w-full p-4 rounded-xl bg-slate-900 text-white hover:bg-slate-800 transition-colors flex items-center justify-between gap-3 text-left cursor-pointer disabled:opacity-50"
-              >
-                <div className="flex items-center gap-3">
-                  <UserCheck className="w-5 h-5 shrink-0" />
-                  <div>
-                    <div className="text-sm font-semibold">
-                      {loadingIntent === 'socio' ? 'Conectando...' : 'Ingresar como Afiliado'}
-                    </div>
-                    <div className="text-[11px] text-slate-300">
-                      Mi red multinivel, rangos, billetera y Marketplace
-                    </div>
-                  </div>
+            {selectedLoginMode === 'affiliate' && (
+              <div className="flex items-center gap-3 text-[11px] text-slate-400">
+                <div className="flex-1 h-px bg-slate-200" />
+                <span>o continúa sin PIN</span>
+                <div className="flex-1 h-px bg-slate-200" />
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={() => handleGoogleLogin(selectedLoginMode)}
+              disabled={loggingIn || pinBusy}
+              className={`w-full py-3.5 px-4 rounded-xl transition-colors flex items-center justify-between gap-3 text-left cursor-pointer disabled:opacity-50 ${
+                selectedLoginMode === 'admin'
+                  ? 'bg-[#8B1E24] text-white hover:bg-[#73181D]'
+                  : 'bg-white border border-slate-300 text-slate-900 hover:border-[#8B1E24]'
+              }`}
+            >
+              <div>
+                <div className="text-sm font-semibold">
+                  {loggingIn
+                    ? 'Conectando con Google...'
+                    : selectedLoginMode === 'affiliate'
+                      ? 'Continuar con Google como Afiliado'
+                      : 'Continuar con Google como Administrador'}
                 </div>
-                <ArrowRight className="w-4 h-4 shrink-0" />
-              </button>
-            </div>
+                <div className={`text-[11px] ${selectedLoginMode === 'admin' ? 'text-red-100' : 'text-slate-500'}`}>
+                  {selectedLoginMode === 'affiliate'
+                    ? 'Registro nuevo o ingreso directo con tu cuenta de Google'
+                    : 'Verificación exclusiva de credenciales de Administrador'}
+                </div>
+              </div>
+              <ArrowRight className="w-4 h-4 shrink-0" />
+            </button>
           </div>
         </div>
       )}

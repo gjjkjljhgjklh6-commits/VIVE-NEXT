@@ -265,8 +265,16 @@ export const StoreModule: React.FC<StoreModuleProps> = ({
 
       {/* Main Split: Catalog Grid (Left) + Cart Summary (Right) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        <div className="lg:col-span-8 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-5">
-          {filteredProducts.map((product) => (
+        <div className="lg:col-span-8">
+          {filteredProducts.length === 0 ? (
+            <div className="bg-white border border-slate-200 rounded-xl p-10 text-center text-sm text-slate-500">
+              {products.filter((p) => p.active).length === 0
+                ? 'Aún no hay productos publicados en el Marketplace. Cuando el Administrador suba productos aparecerán aquí.'
+                : 'No hay productos que coincidan con tu búsqueda.'}
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-5">
+              {filteredProducts.map((product) => (
             <div
               key={product.id}
               className="bg-white border border-slate-200 rounded-xl overflow-hidden flex flex-col justify-between hover:border-slate-300 transition-colors"
@@ -318,7 +326,9 @@ export const StoreModule: React.FC<StoreModuleProps> = ({
                 </button>
               </div>
             </div>
-          ))}
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Cart Panel */}

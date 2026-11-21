@@ -1,4 +1,5 @@
 import {
+  arrayUnion,
   collection,
   deleteDoc,
   doc,
@@ -11,6 +12,7 @@ import {
   setDoc,
   updateDoc,
   where,
+  writeBatch,
   type Unsubscribe,
 } from 'firebase/firestore';
 import { auth, db, handleFirestoreError, OperationType } from '../firebase';
@@ -21,6 +23,7 @@ import {
   determineQualifiedRank,
 } from '../data/compensationPlan';
 import type {
+  AffiliatePin,
   AuditLog,
   BinaryLeg,
   BonusType,
@@ -41,6 +44,26 @@ export const BOOTSTRAPPED_ADMIN_EMAIL = 'gjjkjljhgjklh6@gmail.com';
 
 export function isUserBootstrappedAdmin(email?: string | null, emailVerified?: boolean | null): boolean {
   return Boolean(emailVerified && email === BOOTSTRAPPED_ADMIN_EMAIL);
+}
+
+export function normalizeAffiliatePin(raw: string): string {
+  return raw.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+}
+
+export function generateRandomAffiliatePin(): string {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+export async function hashAffiliatePin(rawPin: string): Promise<string> {
+  const normalized = normalizeAffiliatePin(rawPin);
+  if (normalized.length < 4 || normalized.length > 16) {
+    throw new Error('El PIN debe tener entre 4 y 16 caracteres alfanuméricos.');
+  }
+  const bytes = new TextEncoder().encode(normalized);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 function makeId(prefix: string): string {
@@ -79,17 +102,50 @@ export async function logAudit(
   }
 }
 
-export async function seedInitialViveNextData(adminUid: string, adminEmail: string, adminName: string): Promise<void> {
+export async function purgeAllFirestoreData(
+  adminUid: string,
+  adminEmail: string,
+  adminName: string
+): Promise<{ deletedCount: number }> {
+  let deletedCount = 0;
   try {
-    const configSnap = await getDoc(doc(db, 'plan_config', 'default'));
-    if (configSnap.exists()) return;
+    const deleteCollection = async (colName: string) => {
+      const snap = await getDocs(collection(db, colName));
+      for (const d of snap.docs) {
+        if (colName === 'partners') {
+          try {
+            const privSnap = await getDoc(doc(db, 'partners', d.id, 'private', 'info'));
+            if (privSnap.exists()) {
+              await deleteDoc(doc(db, 'partners', d.id, 'private', 'info'));
+              deletedCount++;
+            }
+          } catch {
+            // Ignore if private info doc does not exist
+          }
+        }
+        await deleteDoc(doc(db, colName, d.id));
+        deletedCount++;
+      }
+    };
 
-    await setDoc(doc(db, 'admins', adminUid), {
-      uid: adminUid,
-      email: adminEmail,
-      role: 'admin',
-      createdAt: serverTimestamp(),
-    });
+    await deleteCollection('products');
+    await deleteCollection('orders');
+    await deleteCollection('commissions');
+    await deleteCollection('withdrawals');
+    await deleteCollection('affiliate_pins');
+    await deleteCollection('partners');
+    await deleteCollection('audit_logs');
+
+    const adminRef = doc(db, 'admins', adminUid);
+    const adminSnap = await getDoc(adminRef);
+    if (!adminSnap.exists()) {
+      await setDoc(adminRef, {
+        uid: adminUid,
+        email: adminEmail,
+        role: 'admin',
+        createdAt: serverTimestamp(),
+      });
+    }
 
     await setDoc(doc(db, 'plan_config', 'default'), {
       id: 'default',
@@ -104,582 +160,131 @@ export async function seedInitialViveNextData(adminUid: string, adminEmail: stri
       updatedAt: serverTimestamp(),
     });
 
-    const seedProducts: Array<Omit<Product, 'createdAt' | 'updatedAt'>> = [
-      {
-        id: 'pkg_base',
-        sku: 'VN-PKG-BASE',
-        name: 'Paquete Distribuidor Base',
-        category: 'Paquetes de Afiliación',
-        isPackage: true,
-        packageTier: 'base',
-        retailPriceBs: 1125,
-        wholesalePriceBs: 750,
-        firstPurchaseSurchargeBs: 225,
-        pv: 75,
-        cv: 60,
-        stock: 250,
-        active: true,
-        imageUrl: '/src/assets/images/product_energia_matcha_1794920092488.jpg',
-        description: 'Acceso inicial Vive Next: Venta Directa (50% margen) y Bono de Inicio Rápido (30% en 3 niveles). Incluye 75 PV / 60 CV.',
-      },
-      {
-        id: 'pkg_emprendedor',
-        sku: 'VN-PKG-EMP',
-        name: 'Paquete Emprendedor',
-        category: 'Paquetes de Afiliación',
-        isPackage: true,
-        packageTier: 'emprendedor',
-        retailPriceBs: 2250,
-        wholesalePriceBs: 1500,
-        firstPurchaseSurchargeBs: 450,
-        pv: 150,
-        cv: 120,
-        stock: 180,
-        active: true,
-        imageUrl: '/src/assets/images/product_colageno_next_1794920093968.jpg',
-        description: 'Plan de expansión mensual: Venta Directa (50%), Inicio Rápido (30%) y Bono Unilevel Residual del 20% fijo. 150 PV / 120 CV.',
-      },
-      {
-        id: 'pkg_elite',
-        sku: 'VN-PKG-ELITE',
-        name: 'Paquete Emprendedor Élite',
-        category: 'Paquetes de Afiliación',
-        isPackage: true,
-        packageTier: 'elite',
-        retailPriceBs: 4500,
-        wholesalePriceBs: 3000,
-        firstPurchaseSurchargeBs: 900,
-        pv: 300,
-        cv: 240,
-        stock: 120,
-        active: true,
-        imageUrl: '/src/assets/images/product_elixir_vital_1794920091552.jpg',
-        description: 'Acceso integral a los 9 bonos: Binario Híbrido, Binario Progresivo +5%, Matching Bonus 54%, Fondo de Liderazgo, Piscinas y Premios.',
-      },
-      {
-        id: 'prod_elixir',
-        sku: 'VN-ELX-01',
-        name: 'Elixir Botánico Vital',
-        category: 'Bienestar Celular',
-        isPackage: false,
-        packageTier: 'none',
-        retailPriceBs: 360,
-        wholesalePriceBs: 240,
-        firstPurchaseSurchargeBs: 0,
-        pv: 45,
-        cv: 36,
-        stock: 140,
-        active: true,
-        imageUrl: '/src/assets/images/product_elixir_vital_1794920091552.jpg',
-        description: 'Concentrado botánico antioxidante de alta absorción para vitalidad diaria e inmunidad celular. Margen mayorista 50%.',
-      },
-      {
-        id: 'prod_colageno',
-        sku: 'VN-COL-02',
-        name: 'Colágeno Hidrolizado Next',
-        category: 'Nutrición Avanzada',
-        isPackage: false,
-        packageTier: 'none',
-        retailPriceBs: 450,
-        wholesalePriceBs: 300,
-        firstPurchaseSurchargeBs: 0,
-        pv: 55,
-        cv: 44,
-        stock: 96,
-        active: true,
-        imageUrl: '/src/assets/images/product_colageno_next_1794920093968.jpg',
-        description: 'Péptidos bioactivos de colágeno tipo I y III con vitamina C orgánica para articulaciones, piel y recuperación muscular.',
-      },
-      {
-        id: 'prod_matcha',
-        sku: 'VN-MTC-03',
-        name: 'Superfood Matcha Energía',
-        category: 'Energía y Enfoque',
-        isPackage: false,
-        packageTier: 'none',
-        retailPriceBs: 330,
-        wholesalePriceBs: 220,
-        firstPurchaseSurchargeBs: 0,
-        pv: 40,
-        cv: 32,
-        stock: 112,
-        active: true,
-        imageUrl: '/src/assets/images/product_energia_matcha_1794920092488.jpg',
-        description: 'Fórmula adaptógena de matcha ceremonial y guaraná amazónico para energía limpia sostenida sin picos glucémicos.',
-      },
-      {
-        id: 'prod_omega',
-        sku: 'VN-OMG-04',
-        name: 'Omega-3 Pure Cellular',
-        category: 'Salud Cardiovascular',
-        isPackage: false,
-        packageTier: 'none',
-        retailPriceBs: 390,
-        wholesalePriceBs: 260,
-        firstPurchaseSurchargeBs: 0,
-        pv: 50,
-        cv: 40,
-        stock: 84,
-        active: true,
-        imageUrl: '/src/assets/images/product_omega_pure_1794920093366.jpg',
-        description: 'Ácidos grasos esenciales EPA/DHA purificados molecularmente para función cerebral, visión y equilibrio lipídico.',
-      },
-    ];
+    await setDoc(doc(db, 'partners', 'vn_root'), {
+      id: 'vn_root',
+      ownerUid: adminUid,
+      fullName: adminName || 'Dirección Vive Next',
+      referralCode: 'VN-VISION-01',
+      sponsorId: '',
+      binaryParentId: '',
+      binaryLeg: 'root',
+      packageTier: 'elite',
+      rankId: 'consultor_elite',
+      status: 'activo',
+      role: 'admin',
+      personalPv: 0,
+      personalCv: 0,
+      leftBranchCv: 0,
+      rightBranchCv: 0,
+      teamCv: 0,
+      directCount: 0,
+      activeLines: 0,
+      firstWeekPurchase: false,
+      uplineUids: [adminUid],
+      joinedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
 
-    for (const p of seedProducts) {
-      await setDoc(doc(db, 'products', p.id), {
-        ...p,
+    await setDoc(doc(db, 'partners', 'vn_root', 'private', 'info'), {
+      partnerId: 'vn_root',
+      ownerUid: adminUid,
+      email: adminEmail,
+      phone: '',
+      ciNumber: '',
+      city: 'Santa Cruz de la Sierra',
+      bankName: '',
+      bankAccount: '',
+      updatedAt: serverTimestamp(),
+    });
+
+    const audId = makeId('aud');
+    await setDoc(doc(db, 'audit_logs', audId), {
+      id: audId,
+      actorUid: adminUid,
+      actorEmail: adminEmail,
+      action: 'SYSTEM_PRODUCTION_START_V1',
+      targetCollection: 'plan_config',
+      targetId: 'default',
+      summary: 'Todos los datos previos fueron eliminados. Sistema Vive Next iniciado en limpio para operación real.',
+      createdAt: serverTimestamp(),
+    });
+
+    return { deletedCount };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, 'purgeAllFirestoreData');
+  }
+}
+
+export async function ensureCleanProductionDatabase(
+  adminUid: string,
+  adminEmail: string,
+  adminName: string
+): Promise<void> {
+  try {
+    const markerSnap = await getDocs(
+      query(collection(db, 'audit_logs'), where('action', '==', 'SYSTEM_PRODUCTION_START_V1'))
+    );
+    if (markerSnap.empty) {
+      await purgeAllFirestoreData(adminUid, adminEmail, adminName);
+      return;
+    }
+
+    const adminRef = doc(db, 'admins', adminUid);
+    const adminSnap = await getDoc(adminRef);
+    if (!adminSnap.exists()) {
+      await setDoc(adminRef, {
+        uid: adminUid,
+        email: adminEmail,
+        role: 'admin',
         createdAt: serverTimestamp(),
+      });
+    }
+
+    const configSnap = await getDoc(doc(db, 'plan_config', 'default'));
+    if (!configSnap.exists()) {
+      await setDoc(doc(db, 'plan_config', 'default'), {
+        id: 'default',
+        cvToBsRate: 5,
+        minMonthlyPv: 75,
+        maxPayoutRatioPercent: 48,
+        binaryEquilibriumPercent: 30,
+        minRealConsumptionBs: 350,
+        accumulationMaxDays: 30,
+        firstWeekEndDay: 7,
+        updatedBy: adminEmail,
         updatedAt: serverTimestamp(),
       });
     }
 
-    const seedPartners: Array<Omit<Partner, 'joinedAt' | 'updatedAt'> & { city: string; phone: string }> = [
-      {
+    const rootSnap = await getDoc(doc(db, 'partners', 'vn_root'));
+    if (!rootSnap.exists()) {
+      await setDoc(doc(db, 'partners', 'vn_root'), {
         id: 'vn_root',
         ownerUid: adminUid,
-        fullName: adminName || 'Dirección Visión Next',
+        fullName: adminName || 'Dirección Vive Next',
         referralCode: 'VN-VISION-01',
         sponsorId: '',
         binaryParentId: '',
         binaryLeg: 'root',
         packageTier: 'elite',
-        rankId: 'platino',
+        rankId: 'consultor_elite',
         status: 'activo',
         role: 'admin',
-        personalPv: 300,
-        personalCv: 240,
-        leftBranchCv: 6800,
-        rightBranchCv: 5400,
-        teamCv: 12200,
-        directCount: 3,
-        activeLines: 5,
-        firstWeekPurchase: true,
-        uplineUids: [adminUid],
-        city: 'Santa Cruz de la Sierra',
-        phone: '+591 77012400',
-      },
-      {
-        id: 'vn_p_valeria',
-        ownerUid: adminUid,
-        fullName: 'Valeria Mendoza Rojas',
-        referralCode: 'VN-VAL-102',
-        sponsorId: 'vn_root',
-        binaryParentId: 'vn_root',
-        binaryLeg: 'left',
-        packageTier: 'elite',
-        rankId: 'oro',
-        status: 'activo',
-        role: 'lider',
-        personalPv: 195,
-        personalCv: 156,
-        leftBranchCv: 2900,
-        rightBranchCv: 2450,
-        teamCv: 5350,
-        directCount: 2,
-        activeLines: 3,
-        firstWeekPurchase: true,
-        uplineUids: [adminUid],
-        city: 'Santa Cruz de la Sierra',
-        phone: '+591 76341120',
-      },
-      {
-        id: 'vn_p_carlos',
-        ownerUid: adminUid,
-        fullName: 'Carlos Justiniano Paz',
-        referralCode: 'VN-CAR-103',
-        sponsorId: 'vn_root',
-        binaryParentId: 'vn_root',
-        binaryLeg: 'right',
-        packageTier: 'elite',
-        rankId: 'plata',
-        status: 'activo',
-        role: 'lider',
-        personalPv: 150,
-        personalCv: 120,
-        leftBranchCv: 1900,
-        rightBranchCv: 1620,
-        teamCv: 3520,
-        directCount: 2,
-        activeLines: 2,
-        firstWeekPurchase: true,
-        uplineUids: [adminUid],
-        city: 'Cochabamba',
-        phone: '+591 71482090',
-      },
-      {
-        id: 'vn_p_lucia',
-        ownerUid: adminUid,
-        fullName: 'Lucía Saucedo Terrazas',
-        referralCode: 'VN-LUC-104',
-        sponsorId: 'vn_p_valeria',
-        binaryParentId: 'vn_p_valeria',
-        binaryLeg: 'left',
-        packageTier: 'elite',
-        rankId: 'bronce',
-        status: 'activo',
-        role: 'socio',
-        personalPv: 150,
-        personalCv: 120,
-        leftBranchCv: 980,
-        rightBranchCv: 760,
-        teamCv: 1740,
-        directCount: 1,
-        activeLines: 2,
-        firstWeekPurchase: true,
-        uplineUids: [adminUid],
-        city: 'La Paz',
-        phone: '+591 72051900',
-      },
-      {
-        id: 'vn_p_diego',
-        ownerUid: adminUid,
-        fullName: 'Diego Arce Villarroel',
-        referralCode: 'VN-DIE-105',
-        sponsorId: 'vn_p_valeria',
-        binaryParentId: 'vn_p_valeria',
-        binaryLeg: 'right',
-        packageTier: 'emprendedor',
-        rankId: 'consultor_elite',
-        status: 'activo',
-        role: 'socio',
-        personalPv: 95,
-        personalCv: 76,
-        leftBranchCv: 420,
-        rightBranchCv: 280,
-        teamCv: 700,
-        directCount: 0,
-        activeLines: 1,
-        firstWeekPurchase: false,
-        uplineUids: [adminUid],
-        city: 'Tarija',
-        phone: '+591 75120344',
-      },
-      {
-        id: 'vn_p_andrea',
-        ownerUid: adminUid,
-        fullName: 'Andrea Ribera Chávez',
-        referralCode: 'VN-AND-106',
-        sponsorId: 'vn_p_carlos',
-        binaryParentId: 'vn_p_carlos',
-        binaryLeg: 'left',
-        packageTier: 'elite',
-        rankId: 'consultor_elite',
-        status: 'activo',
-        role: 'socio',
-        personalPv: 165,
-        personalCv: 132,
-        leftBranchCv: 540,
-        rightBranchCv: 360,
-        teamCv: 900,
-        directCount: 1,
-        activeLines: 1,
-        firstWeekPurchase: true,
-        uplineUids: [adminUid],
-        city: 'Santa Cruz de la Sierra',
-        phone: '+591 78044511',
-      },
-      {
-        id: 'vn_p_mateo',
-        ownerUid: adminUid,
-        fullName: 'Mateo Torrico Suárez',
-        referralCode: 'VN-MAT-107',
-        sponsorId: 'vn_p_carlos',
-        binaryParentId: 'vn_p_carlos',
-        binaryLeg: 'right',
-        packageTier: 'base',
-        rankId: 'consultor_elite',
-        status: 'pendiente',
-        role: 'socio',
-        personalPv: 45,
-        personalCv: 36,
+        personalPv: 0,
+        personalCv: 0,
         leftBranchCv: 0,
         rightBranchCv: 0,
-        teamCv: 36,
+        teamCv: 0,
         directCount: 0,
         activeLines: 0,
         firstWeekPurchase: false,
         uplineUids: [adminUid],
-        city: 'Sucre',
-        phone: '+591 73901122',
-      },
-    ];
-
-    for (const sp of seedPartners) {
-      const { city, phone, ...partnerDoc } = sp;
-      await setDoc(doc(db, 'partners', partnerDoc.id), {
-        ...partnerDoc,
         joinedAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-      await setDoc(doc(db, 'partners', partnerDoc.id, 'private', 'info'), {
-        partnerId: partnerDoc.id,
-        ownerUid: adminUid,
-        email: partnerDoc.id === 'vn_root' ? adminEmail : `${partnerDoc.id.replace('vn_p_', '')}@vivenext.bo`,
-        phone,
-        ciNumber: `SC-${Math.floor(4200000 + Math.random() * 5000000)}`,
-        city,
-        bankName: 'Banco Mercantil Santa Cruz',
-        bankAccount: `4010-${Math.floor(100000 + Math.random() * 899999)}`,
-        updatedAt: serverTimestamp(),
-      });
     }
-
-    const seedOrders: Array<Omit<Order, 'createdAt' | 'updatedAt'>> = [
-      {
-        id: 'ord_seed_1001',
-        orderNumber: 'VN-2026-1001',
-        buyerUid: adminUid,
-        partnerId: 'vn_p_valeria',
-        partnerName: 'Valeria Mendoza Rojas',
-        sponsorId: 'vn_root',
-        isFirstPurchase: true,
-        items: [
-          {
-            productId: 'pkg_elite',
-            sku: 'VN-PKG-ELITE',
-            name: 'Paquete Emprendedor Élite',
-            quantity: 1,
-            unitWholesaleBs: 3000,
-            unitRetailBs: 4500,
-            unitSurchargeBs: 900,
-            unitPv: 300,
-            unitCv: 240,
-            isPackage: true,
-            packageTier: 'elite',
-          },
-        ],
-        subtotalBs: 3000,
-        surchargeBs: 900,
-        totalBs: 3900,
-        totalPv: 300,
-        totalCv: 240,
-        paymentMethod: 'qr',
-        paymentReference: 'QR-BMSC-884210',
-        receiptNote: 'Pago QR Simple validado en cuenta corporativa Santa Cruz',
-        paymentStatus: 'validado',
-        validatedBy: adminEmail,
-      },
-      {
-        id: 'ord_seed_1002',
-        orderNumber: 'VN-2026-1002',
-        buyerUid: adminUid,
-        partnerId: 'vn_p_andrea',
-        partnerName: 'Andrea Ribera Chávez',
-        sponsorId: 'vn_p_carlos',
-        isFirstPurchase: false,
-        items: [
-          {
-            productId: 'prod_colageno',
-            sku: 'VN-COL-02',
-            name: 'Colágeno Hidrolizado Next',
-            quantity: 2,
-            unitWholesaleBs: 300,
-            unitRetailBs: 450,
-            unitSurchargeBs: 0,
-            unitPv: 55,
-            unitCv: 44,
-            isPackage: false,
-            packageTier: 'none',
-          },
-          {
-            productId: 'prod_elixir',
-            sku: 'VN-ELX-01',
-            name: 'Elixir Botánico Vital',
-            quantity: 1,
-            unitWholesaleBs: 240,
-            unitRetailBs: 360,
-            unitSurchargeBs: 0,
-            unitPv: 45,
-            unitCv: 36,
-            isPackage: false,
-            packageTier: 'none',
-          },
-        ],
-        subtotalBs: 840,
-        surchargeBs: 0,
-        totalBs: 840,
-        totalPv: 155,
-        totalCv: 124,
-        paymentMethod: 'efectivo',
-        paymentReference: 'CAJA-SCZ-0412',
-        receiptNote: 'Cancelado en efectivo oficina Equipetrol, pendiente de arqueo',
-        paymentStatus: 'pendiente',
-        validatedBy: '',
-      },
-      {
-        id: 'ord_seed_1003',
-        orderNumber: 'VN-2026-1003',
-        buyerUid: adminUid,
-        partnerId: 'vn_p_mateo',
-        partnerName: 'Mateo Torrico Suárez',
-        sponsorId: 'vn_p_carlos',
-        isFirstPurchase: true,
-        items: [
-          {
-            productId: 'pkg_emprendedor',
-            sku: 'VN-PKG-EMP',
-            name: 'Paquete Emprendedor',
-            quantity: 1,
-            unitWholesaleBs: 1500,
-            unitRetailBs: 2250,
-            unitSurchargeBs: 450,
-            unitPv: 150,
-            unitCv: 120,
-            isPackage: true,
-            packageTier: 'emprendedor',
-          },
-        ],
-        subtotalBs: 1500,
-        surchargeBs: 450,
-        totalBs: 1950,
-        totalPv: 150,
-        totalCv: 120,
-        paymentMethod: 'qr',
-        paymentReference: 'QR-BNB-552109',
-        receiptNote: 'Upgrade a Paquete Emprendedor vía QR BNB',
-        paymentStatus: 'pendiente',
-        validatedBy: '',
-      },
-    ];
-
-    for (const o of seedOrders) {
-      await setDoc(doc(db, 'orders', o.id), {
-        ...o,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    }
-
-    const period = formatPeriodMonth();
-    const seedCommissions: Array<Omit<Commission, 'createdAt'>> = [
-      {
-        id: 'com_seed_1',
-        partnerId: 'vn_root',
-        partnerUid: adminUid,
-        partnerName: adminName || 'Dirección Visión Next',
-        sourceOrderId: 'ord_seed_1001',
-        bonusType: 'B2_INICIO_RAPIDO',
-        level: 1,
-        baseCv: 240,
-        ratePercent: 25,
-        amountBs: 750,
-        status: 'disponible',
-        periodMonth: period,
-        description: 'Inicio Rápido Nivel 1 (25%) por afiliación Élite de Valeria Mendoza',
-      },
-      {
-        id: 'com_seed_2',
-        partnerId: 'vn_root',
-        partnerUid: adminUid,
-        partnerName: adminName || 'Dirección Visión Next',
-        sourceOrderId: 'cycle_prev',
-        bonusType: 'B3_UNILEVEL',
-        level: 1,
-        baseCv: 1850,
-        ratePercent: 20,
-        amountBs: 1850,
-        status: 'disponible',
-        periodMonth: period,
-        description: 'Unilevel Residual 20% fijo · Captura de líneas activas Platino',
-      },
-      {
-        id: 'com_seed_3',
-        partnerId: 'vn_root',
-        partnerUid: adminUid,
-        partnerName: adminName || 'Dirección Visión Next',
-        sourceOrderId: 'cycle_prev',
-        bonusType: 'B4_BINARIO',
-        level: 0,
-        baseCv: 5400,
-        ratePercent: 14,
-        amountBs: 3780,
-        status: 'disponible',
-        periodMonth: period,
-        description: 'Binario Híbrido 14% Platino sobre 5.400 CV rama menor (1 CV = 5 Bs)',
-      },
-      {
-        id: 'com_seed_4',
-        partnerId: 'vn_root',
-        partnerUid: adminUid,
-        partnerName: adminName || 'Dirección Visión Next',
-        sourceOrderId: 'cycle_prev',
-        bonusType: 'B5_BINARIO_PROGRESIVO',
-        level: 0,
-        baseCv: 5400,
-        ratePercent: 5,
-        amountBs: 1350,
-        status: 'disponible',
-        periodMonth: period,
-        description: 'Binario Progresivo +5% Extra por recompra en días 1–7 del mes',
-      },
-      {
-        id: 'com_seed_5',
-        partnerId: 'vn_root',
-        partnerUid: adminUid,
-        partnerName: adminName || 'Dirección Visión Next',
-        sourceOrderId: 'cycle_prev',
-        bonusType: 'B6_MATCHING',
-        level: 1,
-        baseCv: 1592,
-        ratePercent: 50,
-        amountBs: 796,
-        status: 'pagada',
-        periodMonth: period,
-        description: 'Matching Bonus 50% Nivel 1 sobre Bono Binario de directos',
-      },
-    ];
-
-    for (const c of seedCommissions) {
-      await setDoc(doc(db, 'commissions', c.id), {
-        ...c,
-        createdAt: serverTimestamp(),
-      });
-    }
-
-    const seedWithdrawals: Array<Omit<Withdrawal, 'createdAt' | 'updatedAt'>> = [
-      {
-        id: 'wdr_seed_1',
-        partnerId: 'vn_root',
-        partnerUid: adminUid,
-        partnerName: adminName || 'Dirección Visión Next',
-        amountBs: 1200,
-        method: 'transferencia_bancaria',
-        destinationAccount: 'BMSC · Cta 4010-778210',
-        status: 'aprobado',
-        reviewedBy: adminEmail,
-        reviewNote: 'Desembolso liquidado vía ACH',
-      },
-      {
-        id: 'wdr_seed_2',
-        partnerId: 'vn_root',
-        partnerUid: adminUid,
-        partnerName: adminName || 'Dirección Visión Next',
-        amountBs: 650,
-        method: 'qr_bolivia',
-        destinationAccount: 'QR Banco Unión · 77012400',
-        status: 'pendiente',
-        reviewedBy: '',
-        reviewNote: '',
-      },
-    ];
-
-    for (const w of seedWithdrawals) {
-      await setDoc(doc(db, 'withdrawals', w.id), {
-        ...w,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    }
-
-    await logAudit(
-      'SYSTEM_SEED',
-      'plan_config',
-      'default',
-      'Inicialización oficial del Plan de Prosperidad Vive Next 2026, catálogo de productos y red base.'
-    );
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, 'seedInitialViveNextData');
+    handleFirestoreError(error, OperationType.WRITE, 'ensureCleanProductionDatabase');
   }
 }
 
@@ -744,6 +349,376 @@ export async function registerPartnerNode(params: {
   }
 }
 
+export async function adminCreatePartner(params: {
+  adminUid: string;
+  fullName: string;
+  referralCode?: string;
+  accessPin?: string;
+  sponsorId: string;
+  binaryParentId: string;
+  binaryLeg: BinaryLeg;
+  packageTier: PackageTier;
+  rankId: RankId;
+  role: UserRole;
+  status: 'activo' | 'pendiente' | 'inactivo';
+  personalPv: number;
+  personalCv: number;
+  firstWeekPurchase: boolean;
+  ownerUid?: string;
+  email: string;
+  phone: string;
+  ciNumber: string;
+  city: string;
+  bankName: string;
+  bankAccount: string;
+  sponsorPartner?: Partner | null;
+}): Promise<Partner & { plainPin?: string }> {
+  const id = makeId('soc');
+  const cleanName = params.fullName.trim().slice(0, 120);
+  const rawOwnerUid = (params.ownerUid || '').trim().replace(/[^a-zA-Z0-9_-]/g, '');
+  const effectiveOwnerUid = (rawOwnerUid || params.adminUid).slice(0, 128);
+
+  const rawRef = (params.referralCode || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+  const prefix = cleanName.slice(0, 3).toUpperCase().replace(/[^A-Z]/g, 'X').padEnd(3, 'X');
+  const referralCode = (rawRef.length >= 3 ? rawRef : `VN-${prefix}-${Math.floor(100 + Math.random() * 899)}`).slice(0, 32);
+
+  const cleanPin = params.accessPin ? normalizeAffiliatePin(params.accessPin) : '';
+  let pinHash = '';
+  if (cleanPin.length > 0) {
+    if (cleanPin.length < 4 || cleanPin.length > 16) {
+      throw new Error('El PIN de acceso debe tener entre 4 y 16 caracteres.');
+    }
+    pinHash = await hashAffiliatePin(cleanPin);
+    const existingPinSnap = await getDoc(doc(db, 'affiliate_pins', pinHash));
+    if (existingPinSnap.exists()) {
+      throw new Error('Ese PIN ya está asignado a otro afiliado. Elige otro PIN o genera uno nuevo.');
+    }
+  }
+
+  const uplineSet = new Set<string>([
+    ...(params.sponsorPartner?.uplineUids || []),
+    params.sponsorPartner?.ownerUid || '',
+    params.adminUid,
+    effectiveOwnerUid,
+  ]);
+  uplineSet.delete('');
+  const uplineUids = Array.from(uplineSet).slice(0, 20);
+
+  const pv = Math.max(0, Number(params.personalPv) || 0);
+  const cv = Math.max(0, Number(params.personalCv) || 0);
+
+  const partnerData = {
+    id,
+    ownerUid: effectiveOwnerUid,
+    fullName: cleanName,
+    referralCode,
+    sponsorId: (params.sponsorId || 'vn_root').slice(0, 128),
+    binaryParentId: (params.binaryParentId || params.sponsorId || 'vn_root').slice(0, 128),
+    binaryLeg: params.binaryLeg,
+    packageTier: params.packageTier,
+    rankId: params.rankId,
+    status: params.status,
+    role: params.role,
+    personalPv: pv,
+    personalCv: cv,
+    leftBranchCv: 0,
+    rightBranchCv: 0,
+    teamCv: cv,
+    directCount: 0,
+    activeLines: 0,
+    firstWeekPurchase: Boolean(params.firstWeekPurchase),
+    uplineUids,
+    ...(pinHash ? { pinHash } : {}),
+    joinedAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+
+  try {
+    await setDoc(doc(db, 'partners', id), partnerData);
+    await setDoc(doc(db, 'partners', id, 'private', 'info'), {
+      partnerId: id,
+      ownerUid: effectiveOwnerUid,
+      email: params.email.trim().slice(0, 200),
+      phone: (params.phone.trim() || '+591').slice(0, 40),
+      ciNumber: (params.ciNumber.trim() || 'Pendiente').slice(0, 40),
+      city: (params.city.trim() || 'Santa Cruz de la Sierra').slice(0, 80),
+      bankName: (params.bankName.trim() || 'Por definir').slice(0, 80),
+      bankAccount: (params.bankAccount.trim() || 'Por definir').slice(0, 64),
+      updatedAt: serverTimestamp(),
+    });
+
+    if (pinHash && cleanPin) {
+      await setDoc(doc(db, 'affiliate_pins', pinHash), {
+        id: pinHash,
+        pinCode: cleanPin,
+        partnerId: id,
+        partnerName: cleanName,
+        referralCode,
+        active: true,
+        claimedByUid: rawOwnerUid || '',
+        createdBy: params.adminUid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    if (params.sponsorPartner) {
+      await updateDoc(doc(db, 'partners', params.sponsorPartner.id), {
+        directCount: (params.sponsorPartner.directCount || 0) + 1,
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    await logAudit(
+      'PARTNER_CREATED_BY_ADMIN',
+      'partners',
+      id,
+      `Afiliado creado desde Panel de Administrador: ${cleanName} (${referralCode}) · Paquete ${params.packageTier}${cleanPin ? ' · con PIN de acceso' : ''}`
+    );
+
+    return { ...(partnerData as Partner), plainPin: cleanPin || undefined };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `partners/${id}`);
+  }
+}
+
+export async function adminAssignAffiliatePin(
+  partner: Partner,
+  adminUid: string,
+  customPin?: string
+): Promise<AffiliatePin> {
+  const cleanPin = normalizeAffiliatePin(customPin || generateRandomAffiliatePin());
+  if (cleanPin.length < 4 || cleanPin.length > 16) {
+    throw new Error('El PIN debe tener entre 4 y 16 caracteres alfanuméricos.');
+  }
+  const pinHash = await hashAffiliatePin(cleanPin);
+  try {
+    const existingPinSnap = await getDoc(doc(db, 'affiliate_pins', pinHash));
+    if (existingPinSnap.exists()) {
+      const existingData = existingPinSnap.data() as AffiliatePin;
+      if (existingData.partnerId !== partner.id) {
+        throw new Error('Ese PIN ya pertenece a otro afiliado. Elige otro PIN.');
+      }
+    }
+
+    if (partner.pinHash && partner.pinHash !== pinHash) {
+      try {
+        await deleteDoc(doc(db, 'affiliate_pins', partner.pinHash));
+      } catch {
+        // Ignore if old PIN doc does not exist
+      }
+    }
+
+    const pinDoc: Omit<AffiliatePin, 'createdAt' | 'updatedAt'> = {
+      id: pinHash,
+      pinCode: cleanPin,
+      partnerId: partner.id,
+      partnerName: partner.fullName.slice(0, 120),
+      referralCode: partner.referralCode.slice(0, 32),
+      active: true,
+      claimedByUid: '',
+      createdBy: adminUid,
+    };
+
+    await setDoc(doc(db, 'affiliate_pins', pinHash), {
+      ...pinDoc,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    await updateDoc(doc(db, 'partners', partner.id), {
+      pinHash,
+      updatedAt: serverTimestamp(),
+    });
+
+    await logAudit(
+      'PARTNER_PIN_ISSUED',
+      'affiliate_pins',
+      pinHash,
+      `PIN de acceso asignado a ${partner.fullName} (${partner.referralCode})`
+    );
+
+    return { ...pinDoc, createdAt: null, updatedAt: null };
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('pertenece a otro afiliado')) {
+      throw error;
+    }
+    handleFirestoreError(error, OperationType.WRITE, `affiliate_pins/${pinHash}`);
+  }
+}
+
+export async function adminToggleAffiliatePin(pin: AffiliatePin, active: boolean): Promise<void> {
+  try {
+    await updateDoc(doc(db, 'affiliate_pins', pin.id), {
+      active,
+      updatedAt: serverTimestamp(),
+    });
+    await logAudit(
+      active ? 'PARTNER_PIN_ENABLED' : 'PARTNER_PIN_DISABLED',
+      'affiliate_pins',
+      pin.id,
+      `PIN de ${pin.partnerName} ${active ? 'activado' : 'desactivado'}`
+    );
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `affiliate_pins/${pin.id}`);
+  }
+}
+
+export async function adminResetAffiliatePinClaim(pin: AffiliatePin): Promise<void> {
+  try {
+    await updateDoc(doc(db, 'affiliate_pins', pin.id), {
+      claimedByUid: '',
+      active: true,
+      updatedAt: serverTimestamp(),
+    });
+    await logAudit(
+      'PARTNER_PIN_UNLOCKED',
+      'affiliate_pins',
+      pin.id,
+      `Vinculación de Google restablecida para el PIN de ${pin.partnerName}`
+    );
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `affiliate_pins/${pin.id}`);
+  }
+}
+
+export async function verifyAndClaimAffiliatePin(
+  rawPin: string,
+  userUid: string,
+  isBootAdmin: boolean
+): Promise<{ partnerId: string; partnerName: string; referralCode: string }> {
+  const cleanPin = normalizeAffiliatePin(rawPin);
+  if (cleanPin.length < 4 || cleanPin.length > 16) {
+    throw new Error('Ingresa un PIN válido de 4 a 16 caracteres.');
+  }
+  const pinHash = await hashAffiliatePin(cleanPin);
+
+  let pinSnap;
+  try {
+    pinSnap = await getDoc(doc(db, 'affiliate_pins', pinHash));
+  } catch {
+    throw new Error('PIN inválido, inactivo o ya vinculado a otra cuenta de Google.');
+  }
+
+  if (!pinSnap.exists()) {
+    throw new Error('PIN no encontrado. Verifica el código con el Administrador.');
+  }
+
+  const pinData = pinSnap.data() as AffiliatePin;
+  if (!pinData.active) {
+    throw new Error('Este PIN está desactivado por el Administrador.');
+  }
+
+  if (isBootAdmin) {
+    return {
+      partnerId: pinData.partnerId,
+      partnerName: pinData.partnerName,
+      referralCode: pinData.referralCode,
+    };
+  }
+
+  if (pinData.claimedByUid && pinData.claimedByUid !== userUid) {
+    throw new Error('Este PIN ya está vinculado a otra cuenta de Google. Pide un nuevo PIN al Administrador.');
+  }
+
+  if (!pinData.claimedByUid) {
+    try {
+      const batch = writeBatch(db);
+      batch.update(doc(db, 'affiliate_pins', pinHash), {
+        claimedByUid: userUid,
+        updatedAt: serverTimestamp(),
+      });
+      batch.update(doc(db, 'partners', pinData.partnerId), {
+        ownerUid: userUid,
+        uplineUids: arrayUnion(userUid),
+        updatedAt: serverTimestamp(),
+      });
+      batch.update(doc(db, 'partners', pinData.partnerId, 'private', 'info'), {
+        ownerUid: userUid,
+        updatedAt: serverTimestamp(),
+      });
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `affiliate_pins/${pinHash}`);
+    }
+  }
+
+  return {
+    partnerId: pinData.partnerId,
+    partnerName: pinData.partnerName,
+    referralCode: pinData.referralCode,
+  };
+}
+
+export async function verifyAffiliatePinDirect(
+  rawPin: string
+): Promise<{ partnerId: string; pinHash: string; partnerName: string; referralCode: string }> {
+  const cleanPin = normalizeAffiliatePin(rawPin);
+  if (cleanPin.length < 4 || cleanPin.length > 16) {
+    throw new Error('Ingresa un PIN válido de 4 a 16 caracteres.');
+  }
+  const pinHash = await hashAffiliatePin(cleanPin);
+
+  let pinSnap;
+  try {
+    pinSnap = await getDoc(doc(db, 'affiliate_pins', pinHash));
+  } catch {
+    throw new Error('PIN no encontrado o desactivado. Verifica el código con el Administrador.');
+  }
+
+  if (!pinSnap.exists()) {
+    throw new Error('PIN no encontrado. Verifica el código con el Administrador.');
+  }
+
+  const pinData = pinSnap.data() as AffiliatePin;
+  if (!pinData.active) {
+    throw new Error('Este PIN está desactivado por el Administrador.');
+  }
+
+  const partnerSnap = await getDoc(doc(db, 'partners', pinData.partnerId));
+  if (!partnerSnap.exists()) {
+    throw new Error('La ficha del afiliado asociado a este PIN ya no existe.');
+  }
+
+  return {
+    partnerId: pinData.partnerId,
+    pinHash,
+    partnerName: pinData.partnerName,
+    referralCode: pinData.referralCode,
+  };
+}
+
+export async function adminUpdatePartnerPrivateEmail(
+  partner: Partner,
+  email: string
+): Promise<void> {
+  const cleanEmail = email.trim().slice(0, 200);
+  try {
+    const ref = doc(db, 'partners', partner.id, 'private', 'info');
+    const snap = await getDoc(ref);
+    if (snap.exists()) {
+      await updateDoc(ref, {
+        email: cleanEmail,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await setDoc(ref, {
+        partnerId: partner.id,
+        ownerUid: partner.ownerUid,
+        email: cleanEmail,
+        phone: '+591',
+        ciNumber: 'Pendiente',
+        city: 'Santa Cruz de la Sierra',
+        bankName: 'Por definir',
+        bankAccount: 'Por definir',
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `partners/${partner.id}/private/info`);
+  }
+}
+
 export async function updatePartnerPrivateInfo(
   partnerId: string,
   updates: Pick<PartnerPrivateInfo, 'phone' | 'ciNumber' | 'city' | 'bankName' | 'bankAccount'>
@@ -796,6 +771,22 @@ export async function adminUpdatePartner(
 
 export async function adminDeletePartner(partnerId: string, partnerName: string): Promise<void> {
   try {
+    try {
+      const pinSnaps = await getDocs(query(collection(db, 'affiliate_pins'), where('partnerId', '==', partnerId)));
+      for (const pDoc of pinSnaps.docs) {
+        await deleteDoc(doc(db, 'affiliate_pins', pDoc.id));
+      }
+    } catch {
+      // Ignore if no PIN docs exist
+    }
+    try {
+      const privSnap = await getDoc(doc(db, 'partners', partnerId, 'private', 'info'));
+      if (privSnap.exists()) {
+        await deleteDoc(doc(db, 'partners', partnerId, 'private', 'info'));
+      }
+    } catch {
+      // Ignore if private info doc does not exist
+    }
     await deleteDoc(doc(db, 'partners', partnerId));
     await logAudit(
       'PARTNER_DELETED',
@@ -884,9 +875,18 @@ export async function adminDeleteCommission(commissionId: string): Promise<void>
 export async function createOrder(order: Omit<Order, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt'>): Promise<string> {
   const id = makeId('ord');
   const orderNumber = `VN-2026-${Math.floor(1000 + Math.random() * 8999)}`;
+  let pinProof = '';
+  if (!auth.currentUser) {
+    try {
+      pinProof = sessionStorage.getItem('vn_pin_hash') || '';
+    } catch {
+      pinProof = '';
+    }
+  }
   try {
     await setDoc(doc(db, 'orders', id), {
       ...order,
+      ...(pinProof ? { pinProof } : {}),
       id,
       orderNumber,
       createdAt: serverTimestamp(),
@@ -1173,9 +1173,18 @@ export async function requestWithdrawal(payload: {
   destinationAccount: string;
 }): Promise<void> {
   const id = makeId('wdr');
+  let pinProof = '';
+  if (!auth.currentUser) {
+    try {
+      pinProof = sessionStorage.getItem('vn_pin_hash') || '';
+    } catch {
+      pinProof = '';
+    }
+  }
   try {
     await setDoc(doc(db, 'withdrawals', id), {
       ...payload,
+      ...(pinProof ? { pinProof } : {}),
       id,
       status: 'pendiente',
       reviewedBy: '',
@@ -1355,11 +1364,42 @@ export function subscribePartners(uid: string, isAdmin: boolean, cb: (items: Par
   );
 }
 
+export function subscribePartnersForPin(partnerId: string, cb: (items: Partner[]) => void): Unsubscribe {
+  const path = 'partners';
+  const q = query(collection(db, path), where('status', 'in', ['activo', 'pendiente', 'inactivo']));
+  return onSnapshot(
+    q,
+    async (snap) => {
+      const list = snap.docs.map((d) => d.data() as Partner);
+      if (!list.some((p) => p.id === partnerId)) {
+        try {
+          const ownDoc = await getDoc(doc(db, path, partnerId));
+          if (ownDoc.exists()) list.push(ownDoc.data() as Partner);
+        } catch {
+          // Ignore if partner doc is missing or inaccessible
+        }
+      }
+      cb(list);
+    },
+    (err) => handleFirestoreError(err, OperationType.LIST, path)
+  );
+}
+
 export function subscribeOrders(uid: string, isAdmin: boolean, cb: (items: Order[]) => void): Unsubscribe {
   const path = 'orders';
   const q = isAdmin
     ? query(collection(db, path), orderBy('createdAt', 'desc'))
     : query(collection(db, path), where('buyerUid', '==', uid));
+  return onSnapshot(
+    q,
+    (snap) => cb(snap.docs.map((d) => d.data() as Order)),
+    (err) => handleFirestoreError(err, OperationType.LIST, path)
+  );
+}
+
+export function subscribeOrdersForPartner(partnerId: string, cb: (items: Order[]) => void): Unsubscribe {
+  const path = 'orders';
+  const q = query(collection(db, path), where('partnerId', '==', partnerId));
   return onSnapshot(
     q,
     (snap) => cb(snap.docs.map((d) => d.data() as Order)),
@@ -1379,11 +1419,31 @@ export function subscribeCommissions(uid: string, isAdmin: boolean, cb: (items: 
   );
 }
 
+export function subscribeCommissionsForPartner(partnerId: string, cb: (items: Commission[]) => void): Unsubscribe {
+  const path = 'commissions';
+  const q = query(collection(db, path), where('partnerId', '==', partnerId));
+  return onSnapshot(
+    q,
+    (snap) => cb(snap.docs.map((d) => d.data() as Commission)),
+    (err) => handleFirestoreError(err, OperationType.LIST, path)
+  );
+}
+
 export function subscribeWithdrawals(uid: string, isAdmin: boolean, cb: (items: Withdrawal[]) => void): Unsubscribe {
   const path = 'withdrawals';
   const q = isAdmin
     ? query(collection(db, path), orderBy('createdAt', 'desc'))
     : query(collection(db, path), where('partnerUid', '==', uid));
+  return onSnapshot(
+    q,
+    (snap) => cb(snap.docs.map((d) => d.data() as Withdrawal)),
+    (err) => handleFirestoreError(err, OperationType.LIST, path)
+  );
+}
+
+export function subscribeWithdrawalsForPartner(partnerId: string, cb: (items: Withdrawal[]) => void): Unsubscribe {
+  const path = 'withdrawals';
+  const q = query(collection(db, path), where('partnerId', '==', partnerId));
   return onSnapshot(
     q,
     (snap) => cb(snap.docs.map((d) => d.data() as Withdrawal)),
@@ -1408,7 +1468,17 @@ export function subscribeAuditLogs(cb: (items: AuditLog[]) => void): Unsubscribe
   );
 }
 
+export function subscribeAffiliatePins(cb: (items: AffiliatePin[]) => void): Unsubscribe {
+  const q = query(collection(db, 'affiliate_pins'));
+  return onSnapshot(
+    q,
+    (snap) => cb(snap.docs.map((d) => d.data() as AffiliatePin)),
+    (err) => handleFirestoreError(err, OperationType.LIST, 'affiliate_pins')
+  );
+}
+
 export async function fetchPartnerPrivateInfo(partnerId: string): Promise<PartnerPrivateInfo | null> {
+  if (!auth.currentUser) return null;
   try {
     const snap = await getDoc(doc(db, 'partners', partnerId, 'private', 'info'));
     return snap.exists() ? (snap.data() as PartnerPrivateInfo) : null;

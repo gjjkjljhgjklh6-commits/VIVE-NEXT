@@ -21,7 +21,7 @@ export const WalletModule: React.FC<WalletModuleProps> = ({
   const [showWithdrawModal, setShowWithdrawModal] = useState(false);
   const [amountBs, setAmountBs] = useState(500);
   const [method, setMethod] = useState<Withdrawal['method']>('qr_bolivia');
-  const [destinationAccount, setDestinationAccount] = useState('QR Banco Unión · 77012400');
+  const [destinationAccount, setDestinationAccount] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
 
@@ -370,6 +370,7 @@ export const WalletModule: React.FC<WalletModuleProps> = ({
                   required
                   value={destinationAccount}
                   onChange={(e) => setDestinationAccount(e.target.value)}
+                  placeholder="Ej. QR Banco Unión / Cuenta BMSC 4010-..."
                   className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg"
                 />
               </div>

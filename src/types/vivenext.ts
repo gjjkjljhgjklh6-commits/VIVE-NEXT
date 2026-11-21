@@ -55,7 +55,21 @@ export interface Partner {
   activeLines: number;
   firstWeekPurchase: boolean;
   uplineUids: string[];
+  pinHash?: string;
   joinedAt: unknown;
+  updatedAt: unknown;
+}
+
+export interface AffiliatePin {
+  id: string;
+  pinCode: string;
+  partnerId: string;
+  partnerName: string;
+  referralCode: string;
+  active: boolean;
+  claimedByUid: string;
+  createdBy: string;
+  createdAt: unknown;
   updatedAt: unknown;
 }
 
@@ -124,6 +138,7 @@ export interface Order {
   receiptNote: string;
   paymentStatus: PaymentStatus;
   validatedBy: string;
+  pinProof?: string;
   createdAt: unknown;
   updatedAt: unknown;
 }
@@ -156,6 +171,7 @@ export interface Withdrawal {
   status: WithdrawalStatus;
   reviewedBy: string;
   reviewNote: string;
+  pinProof?: string;
   createdAt: unknown;
   updatedAt: unknown;
 }
